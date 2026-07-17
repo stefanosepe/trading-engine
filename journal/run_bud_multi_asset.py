@@ -24,21 +24,25 @@ from strategies.bud_bidirectional import BUDBidirectionalStrategy
 logging.basicConfig(level=logging.WARNING)
 
 ASSET_FILES = {
-    "gold": "xauusd_2019_{tf}.csv",
-    "nasdaq100": "nas100_{tf}.csv",
-    "crudeoil": "wtico_{tf}.csv",
+    "btc": {"1h": "btcusdt_1h_full.csv", "4h": "btcusdt_4h.csv", "1d": "btcusdt_1d.csv"},
+    "gold": {"1h": "xauusd_2019_1h.csv", "4h": "xauusd_multi_4h.csv", "1d": "xauusd_multi_1d.csv"},
+    "nasdaq100": {"1h": "nas100_1h.csv", "4h": "nas100_multi_4h.csv", "1d": "nas100_multi_1d.csv"},
+    "crudeoil": {"1h": "wtico_1h.csv", "4h": "wtico_multi_4h.csv", "1d": "wtico_multi_1d.csv"},
 }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--asset", choices=list(ASSET_FILES.keys()), required=True)
-    parser.add_argument("--tf", choices=["1h", "4h"], default="1h")
-    parser.add_argument("--ema-trend-period", type=int, default=50)
+    parser.add_argument("--tf", choices=["1h", "4h", "1d"], default="1h")
+    parser.add_argument("--ema-trend-period", type=int, default=None)
     parser.add_argument("--no-trend-filter", action="store_true")
     args = parser.parse_args()
 
-    filename = ASSET_FILES[args.asset].format(tf=args.tf)
+    if args.ema_trend_period is None:
+        args.ema_trend_period = 60 if args.asset == "btc" else 50
+
+    filename = ASSET_FILES[args.asset][args.tf]
     data_path = Path(__file__).resolve().parent.parent / "data" / filename
     if not data_path.exists():
         raise FileNotFoundError(f"{data_path} non trovato")
