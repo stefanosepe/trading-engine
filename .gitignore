@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.csv
+!README.md
+.env
+*.egg-info/
