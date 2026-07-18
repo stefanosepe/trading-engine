@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.WARNING)
 
 ASSET_FILES = {
     "btc": {"1h": "btcusdt_1h_full.csv", "4h": "btcusdt_4h.csv", "1d": "btcusdt_1d.csv"},
+    "btc_recent": {"4h": "btcusdt_4h_recent.csv", "1d": "btcusdt_1d_recent.csv"},
     "gold": {"1h": "xauusd_2019_1h.csv", "4h": "xauusd_multi_4h.csv", "1d": "xauusd_multi_1d.csv"},
     "nasdaq100": {"1h": "nas100_1h.csv", "4h": "nas100_multi_4h.csv", "1d": "nas100_multi_1d.csv"},
     "crudeoil": {"1h": "wtico_1h.csv", "4h": "wtico_multi_4h.csv", "1d": "wtico_multi_1d.csv"},
@@ -40,7 +41,7 @@ def main():
     args = parser.parse_args()
 
     if args.ema_trend_period is None:
-        args.ema_trend_period = 60 if args.asset == "btc" else 50
+        args.ema_trend_period = 60 if args.asset in ("btc", "btc_recent") else 50
 
     filename = ASSET_FILES[args.asset][args.tf]
     data_path = Path(__file__).resolve().parent.parent / "data" / filename
