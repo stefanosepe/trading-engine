@@ -59,6 +59,11 @@ class SignalEvent:
     # di calcolarli lui.
     stop_price: float | None = None
     take_profit_price: float | None = None
+    # identifica quale strategia ha generato il segnale (es. "BUDStrategy",
+    # "ThirdTouchStrategy"). Valorizzato automaticamente dall'Engine quando
+    # gira piu' di una strategia in parallelo sullo stesso simbolo, cosi'
+    # ogni strategia ha il proprio ciclo di vita dei trade indipendente.
+    source: str | None = None
     type: EventType = field(default=EventType.SIGNAL, init=False)
 
 
@@ -73,6 +78,7 @@ class OrderEvent:
     limit_price: float | None = None
     stop_loss: float | None = None
     take_profit: float | None = None
+    source: str | None = None
     type: EventType = field(default=EventType.ORDER, init=False)
 
 
@@ -86,4 +92,5 @@ class FillEvent:
     fill_price: float
     commission: float
     slippage: float = 0.0
+    source: str | None = None
     type: EventType = field(default=EventType.FILL, init=False)

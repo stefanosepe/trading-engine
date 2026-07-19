@@ -24,20 +24,40 @@ class Engine:
     def __init__(
         self,
         data_feed: DataFeed,
-        strategy: Strategy,
+        strategy: Strategy | list[Strategy],
         risk_manager: RiskManager,
         broker: Broker,
         on_tick=None,  # callback opzionale per monitoraggio esterno (es. dashboard)
     ):
         self.data_feed = data_feed
-        self.strategy = strategy
+        # accetta sia una singola Strategy (compatibilita' con l'uso finora)
+        # sia una lista: piu' strategie cumulabili, ognuna con il proprio
+        # ciclo di vita dei trade sullo stesso simbolo, indipendenti tra loro.
+        self.strategies: list[Strategy] = (
+            [strategy] if isinstance(strategy, Strategy) else list(strategy)
+        )
+        self._strategy_ids = self._assign_strategy_ids(self.strategies)
+
         self.risk_manager = risk_manager
         self.broker = broker
         self.portfolio = Portfolio()
         self.on_tick = on_tick
 
-        # posizione corrente per simbolo, per sapere come chiudere su EXIT
-        self._current_position: dict[str, float] = {}
+        # posizione corrente per (simbolo, strategia), per sapere come
+        # chiudere su EXIT senza che due strategie si pestino i piedi
+        self._current_position: dict[tuple[str, str], float] = {}
+
+    @staticmethod
+    def _assign_strategy_ids(strategies: list[Strategy]) -> list[str]:
+        """Id leggibile per strategia: nome classe, con suffisso numerico
+        se la stessa classe compare piu' volte (es. BUD con parametri diversi)."""
+        counts: dict[str, int] = {}
+        ids = []
+        for s in strategies:
+            base = type(s).__name__
+            counts[base] = counts.get(base, 0) + 1
+            ids.append(base if counts[base] == 1 else f"{base}_{counts[base]}")
+        return ids
 
     def run(self) -> Portfolio:
         for market_event in self.data_feed:
@@ -53,14 +73,15 @@ class Engine:
         for fill in self.broker.check_pending(market_event):
             self.portfolio.record_fill(fill)
             logger.info(
-                "PENDING RESOLVED %s %s qty=%.6f price=%.4f",
-                fill.direction.value, fill.symbol, fill.quantity, fill.fill_price,
+                "PENDING RESOLVED [%s] %s %s qty=%.6f price=%.4f",
+                fill.source, fill.direction.value, fill.symbol, fill.quantity, fill.fill_price,
             )
 
-        signal = self.strategy.on_market_event(market_event)
-
-        if signal is not None:
-            self._handle_signal(signal, market_event.close)
+        for strategy, strategy_id in zip(self.strategies, self._strategy_ids):
+            signal = strategy.on_market_event(market_event)
+            if signal is not None:
+                signal.source = strategy_id
+                self._handle_signal(signal, market_event.close)
 
         equity = self.broker.get_equity()
         self.portfolio.record_equity(market_event.timestamp, equity)
@@ -70,7 +91,8 @@ class Engine:
 
     def _handle_signal(self, signal, current_price: float) -> None:
         symbol = signal.symbol
-        current_qty = self._current_position.get(symbol, 0.0)
+        position_key = (symbol, signal.source)
+        current_qty = self._current_position.get(position_key, 0.0)
 
         if signal.signal_type == SignalType.EXIT:
             if current_qty == 0:
@@ -81,23 +103,26 @@ class Engine:
                 order_type=OrderType.MARKET,
                 direction=OrderDirection.SELL if current_qty > 0 else OrderDirection.BUY,
                 quantity=abs(current_qty),
+                source=signal.source,
             )
         else:
-            if self.broker.has_open_position(symbol):
-                return  # trade gia' in corso su questo simbolo, ignora il segnale
+            if self.broker.has_open_position(symbol, signal.source):
+                return  # questa strategia ha gia' un trade in corso su questo simbolo
             order = self.risk_manager.size_order(
                 signal, current_price, self.broker.get_equity()
             )
             if order is None:
                 return
+            order.source = signal.source
 
         fill = self.broker.execute_order(order)
+        fill.source = signal.source
         self.portfolio.record_fill(fill)
 
         delta = fill.quantity if fill.direction == OrderDirection.BUY else -fill.quantity
-        self._current_position[symbol] = current_qty + delta
+        self._current_position[position_key] = current_qty + delta
 
         logger.info(
-            "FILL %s %s qty=%.6f price=%.4f commission=%.4f",
-            fill.direction.value, symbol, fill.quantity, fill.fill_price, fill.commission,
+            "FILL [%s] %s %s qty=%.6f price=%.4f commission=%.4f",
+            signal.source, fill.direction.value, symbol, fill.quantity, fill.fill_price, fill.commission,
         )

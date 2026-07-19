@@ -30,11 +30,13 @@ class Broker(ABC):
         """
         return []
 
-    def has_open_position(self, symbol: str) -> bool:
+    def has_open_position(self, symbol: str, source: str | None = None) -> bool:
         """
         Hook opzionale: True se il broker ha gia' una posizione/trade
-        aperto su questo simbolo. L'Engine lo usa per evitare di aprire
-        un secondo trade mentre il primo e' ancora in corso. Default
-        False (comportamento invariato per i broker che non lo gestiscono).
+        aperto su questo simbolo (per questa specifica strategia, se piu'
+        strategie girano in parallelo — vedi `source` in SignalEvent).
+        L'Engine lo usa per evitare di aprire un secondo trade mentre il
+        primo e' ancora in corso. Default False (comportamento invariato
+        per i broker che non lo gestiscono).
         """
         return False
