@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 
 from core.events import MarketEvent, SignalEvent, SignalType
 from strategies.base import Strategy
+from strategies.third_touch import ThirdTouchDetector
 
 
 @dataclass
@@ -73,14 +74,29 @@ class BUDStrategy(Strategy):
         atr_period: int = 14,
         stop_buffer_atr_mult: float = 0.25,
         tp_r_multiple: float = 2.0,
+        require_third_touch: bool = False,
+        third_touch_pivot_lookback: int = 3,
+        third_touch_tolerance_pct: float = 0.005,
+        third_touch_approach_pct: float = 0.01,
+        third_touch_lookback_bars: int = 20,
     ):
         """
-        ema_trend_period: se valorizzata, aggiunge il filtro di trend che
-        avevi descritto — si entra LONG solo se il prezzo (alla rottura)
-        e' sopra questa EMA, mai controtrend. None = filtro disattivato.
-        Valore tipico: 60 per crypto, 50 per azionario/indici/commodity
-        (secondo la tua indicazione), ma resta un parametro libero da
-        calibrare come tutti gli altri.
+        ema_trend_period: se valorizzata, aggiunge il filtro di trend — si
+        entra LONG solo se il prezzo (alla rottura) e' sopra questa EMA,
+        mai controtrend. None = filtro disattivato. Valore tipico: 60 per
+        crypto, 50 per azionario/indici/commodity.
+
+        require_third_touch: se True, l'entrata BUD e' un filtro OBBLIGATORIO
+        — si entra SOLO se il trigger di rottura e' vicino a un livello che
+        ha gia' 2 tocchi confermati (in avvicinamento al terzo) o appena
+        arrivato al terzo, secondo ThirdTouchDetector. Nessuna confluenza =
+        nessun segnale, anche se il resto del pattern BUD e' valido.
+
+        Nota sul lato short (via BUDBidirectionalStrategy): il detector
+        interno usa sempre direction="resistance" nel proprio spazio dati
+        — per l'istanza "short", che riceve dati gia' ribaltati dal
+        wrapper, questo diventa automaticamente un supporto nello spazio
+        reale, esattamente come per il resto della logica BUD.
         """
         self.ema_fast_period = ema_fast_period
         self.ema_stop_period = ema_stop_period
@@ -93,6 +109,9 @@ class BUDStrategy(Strategy):
         self.atr_period = atr_period
         self.stop_buffer_atr_mult = stop_buffer_atr_mult
         self.tp_r_multiple = tp_r_multiple
+        self.require_third_touch = require_third_touch
+        self.third_touch_lookback_bars = third_touch_lookback_bars
+        self.third_touch_tolerance_pct = third_touch_tolerance_pct
 
         self._ema_fast_alpha = 2 / (ema_fast_period + 1)
         self._ema_stop_alpha = 2 / (ema_stop_period + 1)
@@ -106,6 +125,19 @@ class BUDStrategy(Strategy):
         self._bars_seen: dict[str, int] = {}
         self._state: dict[str, _SymbolState] = {}
 
+        self._third_touch = (
+            ThirdTouchDetector(
+                direction="resistance",
+                pivot_lookback=third_touch_pivot_lookback,
+                tolerance_pct=third_touch_tolerance_pct,
+                approach_pct=third_touch_approach_pct,
+            )
+            if require_third_touch
+            else None
+        )
+        # ultima confluenza vista per simbolo: (livello_prezzo, indice_barra)
+        self._last_confluence: dict[str, tuple[float, int]] = {}
+
     def reset(self) -> None:
         self._ema_fast.clear()
         self._ema_stop.clear()
@@ -114,6 +146,9 @@ class BUDStrategy(Strategy):
         self._atr.clear()
         self._bars_seen.clear()
         self._state.clear()
+        self._last_confluence.clear()
+        if self._third_touch is not None:
+            self._third_touch.reset()
 
     # ------------------------------------------------------------------
 
@@ -127,6 +162,11 @@ class BUDStrategy(Strategy):
         self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
         if self._bars_seen[symbol] < min_bars:
             return None  # indicatori non ancora affidabili
+
+        if self._third_touch is not None:
+            info = self._third_touch.on_market_event(event)
+            if info is not None and (info.approaching_third or info.third_touch_confirmed):
+                self._last_confluence[symbol] = (info.level_price, self._bars_seen[symbol])
 
         state = self._state.setdefault(symbol, _SymbolState())
         ema_fast = self._ema_fast[symbol]
@@ -262,6 +302,15 @@ class BUDStrategy(Strategy):
                 return None
 
         entry_price = state.trigger_price
+
+        # filtro terzo tocco: obbligatorio se richiesto, nessuna confluenza
+        # recente e vicina al prezzo di entrata = niente segnale
+        if self.require_third_touch and not self._has_third_touch_confluence(
+            symbol, entry_price
+        ):
+            self._reset_to_scanning(state, candle)
+            return None
+
         atr = self._atr[symbol]
         stop_price = (state.stop_ema_at_setup or ema_stop) - self.stop_buffer_atr_mult * atr
 
@@ -275,6 +324,18 @@ class BUDStrategy(Strategy):
 
         self._reset_to_scanning(state, candle)
         return signal
+
+    def _has_third_touch_confluence(self, symbol: str, entry_price: float) -> bool:
+        confluence = self._last_confluence.get(symbol)
+        if confluence is None:
+            return False
+        level_price, seen_at_bar = confluence
+        if self._bars_seen[symbol] - seen_at_bar > self.third_touch_lookback_bars:
+            return False  # confluenza vista troppo tempo fa, non piu' valida
+        # "vicino" = entro un margine un po' piu' largo della tolleranza
+        # di clustering del detector stesso (che e' molto stretta)
+        proximity = self.third_touch_tolerance_pct * 3
+        return abs(entry_price - level_price) / level_price <= proximity
 
     def _reset_to_scanning(self, state: _SymbolState, candle: _Candle) -> None:
         state.phase = "SCANNING"
