@@ -212,6 +212,98 @@ vincite), quindi non e' possibile stimare un win rate realistico da questi
 dati. I backtest gia' fatti (vedi sopra, PaperJournalBroker) restano l'unica
 fonte per quello.
 
+## Calibrazione su "terzo tocco" + "candelina" (376 screenshot, 2026-07-20)
+
+Secondo giro di screenshot, stavolta organizzati dall'utente in due cartelle
+dedicate (`data/terzo tocco/`, `data/candelina/`) per calibrare
+specificamente `strategies/third_touch.py` (ThirdTouchDetector) e la logica
+di "innesco" gia' in `bud_strategy.py`. Spiegazione dell'utente della catena
+completa: avvicinamento multi-giorno a un livello -> 3° tocco -> sotto il
+livello del 3° tocco si forma un BUD -> sotto il livello BUD si forma una
+"candelina" (candela piccola/compressa, schiacciata tra BUD ed EMA10, che
+non chiude sotto EMA10) -> ingresso anticipato sulla candelina.
+
+**Scoperta piu' importante: il timeframe assunto nel codice e' sbagliato.**
+Il docstring di `ThirdTouchDetector` dice esplicitamente "pensato per
+timeframe alti (4h, 1d, weekly): su timeframe bassi il rumore genera troppi
+pivot poco significativi". Su tutti e 7 i batch analizzati (237 screenshot
+unici), la stragrande maggioranza del pattern reale e' osservata su **1m e
+5m**, con 30m minoritario e 4h/1d rari eccezioni. La "costruzione su piu'
+giorni" descritta a parole si traduce quasi sempre in "multi-ora" o anche
+"multi-decina di minuti" sul grafico reale — l'utente scala su timeframe
+molto piu' bassi di quanto la logica attuale assuma.
+
+Altri dettagli sul terzo tocco:
+- Numero di tocchi non sempre 3: osservati anche 2 e 4 tocchi prima del
+  breakout — "terzo tocco" e' piu' il nome del pattern che un conteggio
+  rigido
+- Tolleranza reale tra tocchi tipicamente stretta (0.2-0.5%), coerente con
+  `tolerance_pct=0.005` attuale
+- Distanza in candele tra tocchi molto variabile (5-50+), nessun intervallo
+  fisso
+- Spesso il "livello" non e' un pivot singolo pulito ma un plateau/cluster
+  toccato molte volte ravvicinate (accumulo), non 3 pivot isolati distinti
+- La catena completa (3° tocco + BUD + candelina) e' raramente annotata
+  per intero nello stesso screenshot; quando lo e', le tre fasi spesso
+  "collassano" quasi nello stesso punto del grafico invece di essere
+  nettamente separate nel tempo
+- Un caso (EPS/USDT) mostra lo stesso setup confermato sia su 30m sia su
+  1D con la stessa numerazione — spunto per una possibile validazione
+  multi-timeframe, non implementata
+
+Dettagli sulla candelina (confermano bene la logica gia' scritta in
+`_handle_appoggio`):
+- Compressione tipica 30-60% del range delle candele di appoggio circostanti
+  — coerente con `innesco_contraction_ratio=0.5`
+- Tocco EMA (spesso EMA10, ma in alcuni screenshot EMA5/EMA60/EMA223 a
+  seconda del setup/timeframe — la EMA "di comando" non e' sempre fissa a
+  10) confermato ripetutamente e con label esplicite ("Stop ema 10", "ema10
+  perfezione", "candela di riposo sul supporto", "candela di azzeramento")
+- Candele di appoggio precedenti: molto variabile, 2-6 nella maggioranza dei
+  casi ma piu' fasci (NKNUSDT ~8-10, RGT/PLA/SPARTA/FIS 15-20+) superano
+  `appoggio_max_candles=6` — segnale medio, non abbastanza netto da
+  giustificare un cambio di default senza backtest (vedi sotto, gia'
+  provato ad alzarlo su BTC 1h con risultato negativo)
+- Entrata confermata sempre alla rottura dell'high della candelina, coerente
+  col codice
+
+**Verifica empirica: ThirdTouchDetector ora bug-fixed, testato su 5m/30m
+(il timeframe reale, non piu' solo 1h) con costi realistici** (0.1%/lato +
+0.05% slippage, BTC/USDT, dataset 2019 e 2017-2019 ricampionati da dati 1m):
+
+| TF | Periodo | Config | n | Win rate | PnL |
+|---|---|---|---|---|---|
+| 5m | corto | baseline | 260 | 24.2% | -3024 |
+| 5m | corto | third_touch obbligatorio | 69 | 29.0% | -682 |
+| 5m | lungo | baseline | 2057 | 28.4% | -16953 |
+| 5m | lungo | third_touch obbligatorio | 769 | 29.4% | -5787 |
+| 30m | corto | baseline | 45 | 26.7% | -330 |
+| 30m | corto | third_touch obbligatorio | 15 | 13.3% | -156 |
+| 30m | lungo | baseline | 316 | 38.3% | -695 |
+| 30m | lungo | third_touch obbligatorio | 146 | 39.0% | -309 |
+
+Anche **senza alcun costo di transazione**, 5m resta netto negativo
+(baseline -1022, third-touch -484 su ~2000/770 trade) — conferma la nota
+storica gia' presente in questo documento ("5m ~4 mesi 2019: -12R, sotto
+breakeven"). Il filtro terzo tocco, ora corretto anche sul lato short,
+**riduce sistematicamente il numero di trade (filtra per qualita') e
+dimezza circa le perdite nella maggior parte dei casi**, ma non porta MAI
+la strategia in territorio positivo su nessuna combinazione TF/periodo
+testata. **Conclusione onesta: con la logica di TP a 2R fisso, BUD non e'
+profittevole su BTC a nessun timeframe testato (5m, 30m, 1h) — il problema
+non e' (solo) la qualita' del filtro d'ingresso, e' la struttura
+rischio/rendimento del sistema.**
+
+Provata anche la combinazione swing TP + third_touch su 5m/30m (stesso
+dataset, stessi costi): **il risultato e' NEGATIVO, in ogni combinazione
+peggiora rispetto al solo third_touch** (es. 5m: third_touch da solo -5787,
++ swing p=2 -5892/-6113; 30m: third_touch da solo -309, + swing p=2
+-643/-471). Conferma su timeframe diversi la conclusione gia' vista su 1h:
+lo swing TP scambia win rate con reward medio piu' piccolo, e non e' una
+buona idea combinarlo col filtro terzo tocco. **La configurazione migliore
+trovata finora resta "solo third_touch obbligatorio, TP 2R fisso"** — non
+profittevole, ma quella che perde meno su tutti i timeframe/periodi testati.
+
 ## Implementazione della calibrazione e verifica via backtest (2026-07-20)
 
 Fatto un primo giro di implementazione + verifica empirica su BTC/USDT 1h
@@ -313,31 +405,35 @@ come negli screenshot reali (richiede estensione di Engine/Broker).
 
 ## TODO / prossimi passi aperti
 
-1. **Affinare la logica di TP a swing high** prima di renderla default: idee
-   dagli screenshot da provare — estensione oltre il primo livello quando il
-   momentum e' forte, uscite parziali/scalate. Il floor minimo in R e' stato
-   implementato (`swing_tp_min_r`) ma da solo non basta a rendere positivo
-   l'EV al netto dei costi
-2. **Modellare "Bud Fintato"** (tolleranza a un primo falso breakout prima
-   del trigger valido) — da valutare se estendere `ThirdTouchDetector` o
-   scrivere un meccanismo dedicato
-3. Un vero parameter sweep (multi-asset, multi-periodo) su
-   `bud_lookback_min`/`appoggio_max_candles`/`bud_expansion_mult` invece di
-   un singolo A/B su BTC — il tentativo fatto in questo giro non ha dato
-   segnale pulito
-4. **Commissioni/slippage nel PaperJournalBroker** — attualmente assenti, i
-   risultati sono ottimistici rispetto alla realta'
-5. **Verificare l'ipotesi long/short sbilanciato** su altri periodi/asset —
+1. **Il vincolo che conta adesso: BUD a 2R fisso non e' profittevole su BTC
+   a NESSUN timeframe/periodo testato (5m, 30m, 1h) con costi realistici** —
+   ne' con third_touch, ne' con swing TP, ne' con la combinazione. Prima di
+   inseguire altri filtri/parametri, vale la pena chiedersi se il problema
+   e' strutturale al 2R fisso (vedi punto 2) o alla strategia stessa su
+   questo asset — provare su asset/periodi diversi (punto 3) prima di
+   continuare a ottimizzare solo su BTC
+2. **Ripensare il TP oltre lo swing-al-livello-piu'-vicino**: idee dagli
+   screenshot non ancora provate — estensione oltre il primo livello quando
+   il momentum e' forte, uscite parziali/scalate (piu' fedeli a quanto
+   osservato: gli utenti spesso non escono al primo livello). Il floor
+   minimo in R (`swing_tp_min_r`) e' implementato ma testato solo da solo,
+   non in combinazione con third_touch (dove non ha aiutato)
+3. Un vero parameter sweep (multi-asset, multi-periodo, multi-timeframe)
+   invece di singoli A/B su BTC — nessun tentativo fatto finora ha dato
+   segnale pulito e coerente tra timeframe/periodi diversi
+4. **Verificare l'ipotesi long/short sbilanciato** su altri periodi/asset —
    il campione screenshot non aiuta qui (quasi solo long)
-6. Valutare se modellare gestione dinamica (stop a breakeven, TP scalato,
-   ingressi piramidati) — feature grossa, probabilmente fuori scope per ora
-7. **ActivTrades come broker live**: verificato che offre API solo per clienti
+5. Valutare se modellare gestione dinamica (stop a breakeven, TP scalato,
+   ingressi piramidati) — feature grossa, probabilmente fuori scope per ora,
+   ma coerente con piu' pattern osservati negli screenshot (uscite scalate,
+   secondo ingresso)
+6. **ActivTrades come broker live**: verificato che offre API solo per clienti
    istituzionali, via WebSocket con client .NET ufficiale (nessun supporto Python
    documentato) — se si vuole andare live con questo broker serve un client
    custom, non e' un drop-in come CCXTBroker. Alternative piu' semplici da
    integrare: altri exchange crypto via ccxt, o broker con REST nativa
    (Alpaca, Interactive Brokers)
-8. Ordini stop simulati a chiusura barra, non intrabar — approssimazione presente
+7. Ordini stop simulati a chiusura barra, non intrabar — approssimazione presente
    in tutto il sistema, da tenere a mente specialmente sui timeframe piu' bassi
 
 ## Come rigenerare i dati usati nei test (non versionati nel repo)
@@ -358,6 +454,20 @@ out[(out['timestamp'] >= '2017-08-01') & (out['timestamp'] < '2019-11-01')].to_c
 # dati minuto Oanda ricampionati)
 # repo grande (~870MB tarball completo) — estrarre solo le cartelle/anni serviti:
 #   pyfinancialdata/data/currencies/oanda/{NAS100_USD,WTICO_USD,XAU_USD}/2019/
+
+# BTC/USDT 5m/30m: stesso repo cryptobigbro NON ha file 5m/30m diretti (404),
+# solo 1m (~100MB) e 1h. Scaricare l'1m e ricampionare:
+curl -sL "https://raw.githubusercontent.com/cryptobigbro/binance-BTCUSDT/master/binance-BTCUSDT-1m.csv" -o btc_1m_raw.csv
+python3 -c "
+import pandas as pd
+df = pd.read_csv('btc_1m_raw.csv')
+df['timestamp'] = pd.to_datetime(df['open_timestamp_utc'], unit='s')
+df = df.set_index('timestamp')[['open','high','low','close','volume']]
+for freq, label in [('5min','5m'), ('30min','30m')]:
+    r = df.resample(freq).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
+    r[(r['timestamp'] >= '2019-01-01') & (r['timestamp'] < '2019-05-01')].to_csv(f'data/btcusdt_{label}.csv', index=False)
+    r[(r['timestamp'] >= '2017-08-01') & (r['timestamp'] < '2019-11-01')].to_csv(f'data/btcusdt_{label}_full.csv', index=False)
+"
 ```
 
 ## Runner disponibili in journal/
