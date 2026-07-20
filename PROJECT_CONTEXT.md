@@ -251,12 +251,73 @@ qualitative dagli screenshot. Risultati:
   trade** (breakeven, TP scalato, ingressi piramidati — richiede che
   Engine/Broker sappiano gestire piu' di un TP/SL fissato all'apertura)
 
+## Code review (Fable 5) + bug fix + costi di transazione (2026-07-20)
+
+Doppia review indipendente dell'algoritmo (review preliminare + Fable 5 con
+verifica empirica su dati sintetici). Esito chiave: **nessun lookahead bias**
+nella catena swing TP (verificata l'intera sequenza temporale), ma il win
+rate 69% osservato era in gran parte artefatto geometrico: con
+`swing_pivot_lookback=2` il massimo del BUD stesso viene confermato come
+pivot durante l'appoggio e diventa il target — vicino, quindi facile da
+colpire (baseline casuale con TP a 0.65R ≈ 61%).
+
+Bug trovati e FIXATI in questo giro:
+1. `third_touch.py` + `_has_third_touch_confluence`: divisioni per
+   `level.price` senza `abs()` — col lato short (prezzi ribaltati/negativi)
+   i confronti percentuali erano sempre veri: clustering dei livelli e
+   filtro terzo tocco erano ROTTI sul lato short. NB: le colonne short della
+   grid search terzo-tocco fatta in precedenza non sono attendibili
+2. `bud_strategy.py`: tolleranza innesco `ema_stop * 1.001` → banda
+   ribaltata dalla parte sbagliata con EMA negativa (short piu' severo del
+   long di ~0.2%). Ora additiva con `abs()`
+3. `core/engine.py`: `_current_position` non veniva decrementato quando
+   `check_pending` chiudeva un trade a TP/SL — stato sporco, innocuo per BUD
+   ma un EXIT successivo avrebbe aperto un trade fantasma
+4. `PaperJournalBroker`: aggiunti `commission_pct` (per lato) e
+   `slippage_pct` (solo su fill market/stop: entrata e SL; il TP e' limit,
+   fillato esatto). Default 0 per riproducibilita' dei risultati storici
+5. `FixedRiskPerTradeManager`: aggiunto `max_notional` opzionale (cap sulla
+   size quando lo stop e' quasi a ridosso dell'entrata — in live una size
+   1000x il rischio sarebbe ineseguibile)
+6. `BUDStrategy`: nuovo `swing_tp_min_r` — il target swing non e' piu' il
+   primo livello sopra l'entrata ma il primo sopra `entry + minR * rischio`
+   (scarta i target-briciola tipo il massimo del BUD stesso). Warm-up reso
+   coerente: swing tracker e third-touch osservano tutte le barre dalla prima
+Non fixato (documentato): priorita' silenziosa del long sullo short quando
+entrambi scattano sulla stessa barra nel wrapper bidirezionale; fill degli
+stop senza gap (ottimista su asset con gap overnight: gold/nasdaq/oil);
+statistiche di `Portfolio.summary_stats` fuorvianti (contano i fill, Sharpe
+assume barre daily) — i numeri BUD vengono da `broker.stats()`, non da li'.
+
+**Risultati CON costi realistici (0.1%/lato + 0.05% slippage, BTC/USDT 1h
+2017-2019, `max_notional=5000`):**
+| Config | n | Win rate | PnL netto |
+|---|---|---|---|
+| 2R fisso | 156 | 40.4% | -9 (da +330 senza costi) |
+| swing p=2 | 177 | 55.9% | -139 |
+| swing p=2 + floor 1.0R | 176 | 51.7% | -163 |
+| swing p=2 + floor 1.5R | 175 | 51.4% | -89 |
+| swing p=3 + floor 1.0R | 171 | 48.0% | -199 |
+
+**Conclusione onesta: al netto dei costi NESSUNA configurazione e' oggi
+profittevole su BTC 1h.** Il 2R fisso e' ~breakeven, le varianti swing
+peggio (target medi piccoli = i costi pesano proporzionalmente di piu').
+L'obiettivo "win rate >= 60%" e' raggiungibile meccanicamente coi target
+vicini (69% senza costi) ma non produce expectancy positiva: il vero
+obiettivo deve essere l'EV netto, non il win rate. Le leve realistiche per
+migliorare l'EV: (a) ridurre i costi relativi con timeframe piu' alti o
+stop piu' ampi (nozionale minore a parita' di rischio), (b) migliorare la
+selezione dei segnali (filtri di qualita': trend piu' forte, terzo tocco ora
+che e' fixato anche sul lato short, volume), (c) uscite scalate/trailing
+come negli screenshot reali (richiede estensione di Engine/Broker).
+
 ## TODO / prossimi passi aperti
 
 1. **Affinare la logica di TP a swing high** prima di renderla default: idee
    dagli screenshot da provare — estensione oltre il primo livello quando il
-   momentum e' forte, uscite parziali/scalate, o combinare swing TP con un
-   floor minimo in R (es. `max(swing_target, entry + 1.0R)`)
+   momentum e' forte, uscite parziali/scalate. Il floor minimo in R e' stato
+   implementato (`swing_tp_min_r`) ma da solo non basta a rendere positivo
+   l'EV al netto dei costi
 2. **Modellare "Bud Fintato"** (tolleranza a un primo falso breakout prima
    del trigger valido) — da valutare se estendere `ThirdTouchDetector` o
    scrivere un meccanismo dedicato

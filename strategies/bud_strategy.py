@@ -87,6 +87,7 @@ class BUDStrategy(Strategy):
         use_swing_tp: bool = False,
         swing_pivot_lookback: int = 3,
         swing_max_active_levels: int = 20,
+        swing_tp_min_r: float | None = None,
         require_third_touch: bool = False,
         third_touch_pivot_lookback: int = 3,
         third_touch_tolerance_pct: float = 0.005,
@@ -123,6 +124,14 @@ class BUDStrategy(Strategy):
         PROJECT_CONTEXT.md); il meccanismo resta disponibile e testato per
         chi vuole sperimentarci.
 
+        swing_tp_min_r: se valorizzato insieme a use_swing_tp, il target non
+        e' il primo swing high sopra l'entrata ma il primo swing high sopra
+        `entry + swing_tp_min_r * (entry - stop)` — scarta i target troppo
+        vicini (spesso il massimo del BUD stesso, confermato come pivot
+        durante l'appoggio) che gonfiano il win rate senza pagare abbastanza.
+        Se nessun livello supera il floor, il segnale non porta TP e il
+        RiskManager ricade sul multiplo tp_r_multiple.
+
         require_third_touch: se True, l'entrata BUD e' un filtro OBBLIGATORIO
         — si entra SOLO se il trigger di rottura e' vicino a un livello che
         ha gia' 2 tocchi confermati (in avvicinamento al terzo) o appena
@@ -147,6 +156,7 @@ class BUDStrategy(Strategy):
         self.stop_buffer_atr_mult = stop_buffer_atr_mult
         self.tp_r_multiple = tp_r_multiple
         self.use_swing_tp = use_swing_tp
+        self.swing_tp_min_r = swing_tp_min_r
         self.require_third_touch = require_third_touch
         self.third_touch_lookback_bars = third_touch_lookback_bars
         self.third_touch_tolerance_pct = third_touch_tolerance_pct
@@ -205,18 +215,21 @@ class BUDStrategy(Strategy):
         candle = _Candle(event.timestamp, event.open, event.high, event.low, event.close)
 
         self._update_indicators(symbol, candle)
+        self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
+
+        # i tracker di struttura (swing/terzo tocco) osservano TUTTE le barre
+        # dalla prima: non dipendono dalle EMA e i livelli formati durante il
+        # warm-up degli indicatori sono informazione legittima e preziosa
         if self._swing_tracker is not None:
             self._swing_tracker.on_market_event(event)
-
-        min_bars = max(self.ema_stop_period, self.atr_period, self.ema_trend_period or 0) + 1
-        self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
-        if self._bars_seen[symbol] < min_bars:
-            return None  # indicatori non ancora affidabili
-
         if self._third_touch is not None:
             info = self._third_touch.on_market_event(event)
             if info is not None and (info.approaching_third or info.third_touch_confirmed):
                 self._last_confluence[symbol] = (info.level_price, self._bars_seen[symbol])
+
+        min_bars = max(self.ema_stop_period, self.atr_period, self.ema_trend_period or 0) + 1
+        if self._bars_seen[symbol] < min_bars:
+            return None  # indicatori non ancora affidabili
 
         state = self._state.setdefault(symbol, _SymbolState())
         ema_fast = self._ema_fast[symbol]
@@ -315,7 +328,11 @@ class BUDStrategy(Strategy):
                 is_contracted = (
                     avg_range > 0 and candle.range <= self.innesco_contraction_ratio * avg_range
                 )
-                touches_ema = candle.low <= ema_stop * 1.001  # piccola tolleranza
+                # tolleranza additiva con abs(): con ema negativa (lato short,
+                # dati ribaltati) il vecchio `ema_stop * 1.001` spostava la
+                # soglia dalla parte sbagliata, rendendo lo short piu' severo
+                # del long e rompendo la simmetria del wrapper bidirezionale
+                touches_ema = candle.low <= ema_stop + 0.001 * abs(ema_stop)
                 if is_contracted and touches_ema:
                     state.trigger_price = candle.high
                     state.stop_ema_at_setup = ema_stop
@@ -366,9 +383,13 @@ class BUDStrategy(Strategy):
 
         take_profit_price = None
         if self._swing_tracker is not None:
-            take_profit_price = self._swing_tracker.next_resistance_above(symbol, entry_price)
-        # se nessun livello e' disponibile, take_profit_price resta None e il
-        # RiskManager ricade sul multiplo tp_r_multiple (vedi FixedRiskPerTradeManager)
+            tp_search_floor = entry_price
+            if self.swing_tp_min_r is not None:
+                tp_search_floor = entry_price + self.swing_tp_min_r * (entry_price - stop_price)
+            take_profit_price = self._swing_tracker.next_resistance_above(symbol, tp_search_floor)
+        # se nessun livello e' disponibile (o nessuno sopra il floor minimo in R),
+        # take_profit_price resta None e il RiskManager ricade sul multiplo
+        # tp_r_multiple (vedi FixedRiskPerTradeManager)
 
         signal = SignalEvent(
             symbol=symbol,
@@ -391,7 +412,8 @@ class BUDStrategy(Strategy):
         # "vicino" = entro un margine un po' piu' largo della tolleranza
         # di clustering del detector stesso (che e' molto stretta)
         proximity = self.third_touch_tolerance_pct * 3
-        return abs(entry_price - level_price) / level_price <= proximity
+        # abs() al denominatore: obbligatorio per il lato short (prezzi ribaltati)
+        return abs(entry_price - level_price) / abs(level_price) <= proximity
 
     def _reset_to_scanning(self, state: _SymbolState, candle: _Candle) -> None:
         state.phase = "SCANNING"

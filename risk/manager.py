@@ -112,11 +112,24 @@ class FixedRiskPerTradeManager(RiskManager):
     fisso (tp_r_multiple) rispetto al rischio.
     """
 
-    def __init__(self, risk_per_trade: float, tp_r_multiple: float = 2.0):
+    def __init__(
+        self,
+        risk_per_trade: float,
+        tp_r_multiple: float = 2.0,
+        max_notional: float | None = None,
+    ):
+        """
+        max_notional: cap sul valore nozionale della posizione (quantita' x
+        prezzo). Senza cap, uno stop molto vicino all'entrata (risk_per_unit
+        quasi zero) produce size enormi — innocuo in backtest (la perdita
+        resta ~1R) ma ineseguibile/pericoloso in live. None = nessun cap
+        (comportamento storico).
+        """
         if risk_per_trade <= 0:
             raise ValueError("risk_per_trade deve essere positivo")
         self.risk_per_trade = risk_per_trade
         self.tp_r_multiple = tp_r_multiple
+        self.max_notional = max_notional
 
     def size_order(
         self, signal: SignalEvent, current_price: float, equity: float
@@ -137,6 +150,8 @@ class FixedRiskPerTradeManager(RiskManager):
             return None  # stop dalla parte sbagliata, ordine non valido
 
         quantity = self.risk_per_trade / risk_per_unit
+        if self.max_notional is not None and current_price > 0:
+            quantity = min(quantity, self.max_notional / current_price)
 
         take_profit = signal.take_profit_price
         if take_profit is None:

@@ -137,7 +137,10 @@ class ThirdTouchDetector:
         levels = self._levels.setdefault(symbol, [])
 
         for level in levels:
-            if abs(pivot.price - level.price) / level.price <= self.tolerance_pct:
+            # abs() al denominatore: sul lato short (via BUDBidirectionalStrategy)
+            # i prezzi arrivano ribaltati/negativi e senza abs il confronto
+            # percentuale sarebbe sempre vero (quoziente negativo)
+            if abs(pivot.price - level.price) / abs(level.price) <= self.tolerance_pct:
                 level.add_touch(pivot)
                 return len(level.touches) == 3
 
@@ -155,7 +158,7 @@ class ThirdTouchDetector:
         two_touch_levels = [lv for lv in levels if len(lv.touches) == 2]
 
         for level in two_touch_levels:
-            distance_pct = abs(event.close - level.price) / level.price
+            distance_pct = abs(event.close - level.price) / abs(level.price)
             approaching = distance_pct <= self.approach_pct
             if self.direction == "resistance":
                 approaching = approaching and event.close <= level.price

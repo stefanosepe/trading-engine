@@ -34,13 +34,31 @@ class _OpenTrade:
     stop_loss: float | None
     take_profit: float | None
     opened_at: object
+    entry_commission: float = 0.0
 
 
 class PaperJournalBroker(Broker):
-    def __init__(self, initial_capital: float = 10_000.0):
+    def __init__(
+        self,
+        initial_capital: float = 10_000.0,
+        commission_pct: float = 0.0,
+        slippage_pct: float = 0.0,
+    ):
+        """
+        commission_pct: commissione per lato come frazione del nozionale
+            (es. 0.001 = 0.1% sia all'apertura che alla chiusura). Default 0
+            per compatibilita' con i risultati storici, ma i backtest "seri"
+            dovrebbero passare un valore realistico.
+        slippage_pct: peggioramento del prezzo di fill come frazione del
+            prezzo, applicato SOLO ai fill di tipo market/stop (entrata e
+            stop loss). Il take profit e' un ordine limit: fillato al prezzo
+            esatto, senza slippage — al piu' il mercato lo salta a favore.
+        """
         # capitale puramente virtuale: serve solo come base per il position
         # sizing (es. "rischia il 2% di 10k"), non rappresenta soldi reali
         self.initial_capital = initial_capital
+        self.commission_pct = commission_pct
+        self.slippage_pct = slippage_pct
         # chiave (symbol, source): permette a piu' strategie di avere
         # ciascuna un trade aperto sullo stesso simbolo senza sovrascriversi
         self._open_trades: dict[tuple[str, str], _OpenTrade] = {}
@@ -55,6 +73,16 @@ class PaperJournalBroker(Broker):
         if entry_price is None:
             raise RuntimeError(f"Nessun prezzo disponibile per {order.symbol}")
 
+        # slippage sull'entrata (ordine market): il fill peggiora nella
+        # direzione del trade
+        if self.slippage_pct:
+            if order.direction == OrderDirection.BUY:
+                entry_price *= 1 + self.slippage_pct
+            else:
+                entry_price *= 1 - self.slippage_pct
+
+        entry_commission = abs(entry_price) * order.quantity * self.commission_pct
+
         source = order.source or "default"
         self._open_trades[(order.symbol, source)] = _OpenTrade(
             symbol=order.symbol,
@@ -65,6 +93,7 @@ class PaperJournalBroker(Broker):
             stop_loss=order.stop_loss,
             take_profit=order.take_profit,
             opened_at=order.timestamp,
+            entry_commission=entry_commission,
         )
 
         # fill "informativo": conferma l'apertura, non e' un'esecuzione reale
@@ -74,7 +103,7 @@ class PaperJournalBroker(Broker):
             direction=order.direction,
             quantity=order.quantity,
             fill_price=entry_price,
-            commission=0.0,
+            commission=entry_commission,
             source=source,
         )
 
@@ -105,12 +134,22 @@ class PaperJournalBroker(Broker):
             outcome = "SL" if hit_sl else "TP"
             exit_price = trade.stop_loss if hit_sl else trade.take_profit
 
+            # slippage solo sullo stop (ordine stop/market): il TP e' un limit,
+            # fillato al prezzo esatto
+            if self.slippage_pct and hit_sl:
+                if trade.direction == OrderDirection.BUY:
+                    exit_price *= 1 - self.slippage_pct
+                else:
+                    exit_price *= 1 + self.slippage_pct
+
+            exit_commission = abs(exit_price) * trade.quantity * self.commission_pct
+
             pnl_per_unit = (
                 exit_price - trade.entry_price
                 if trade.direction == OrderDirection.BUY
                 else trade.entry_price - exit_price
             )
-            pnl = pnl_per_unit * trade.quantity
+            pnl = pnl_per_unit * trade.quantity - trade.entry_commission - exit_commission
             won = pnl > 0
 
             self._closed_trades.append(
@@ -141,7 +180,7 @@ class PaperJournalBroker(Broker):
                     direction=exit_direction,
                     quantity=trade.quantity,
                     fill_price=exit_price,
-                    commission=0.0,
+                    commission=exit_commission,
                     source=trade.source,
                 )
             )

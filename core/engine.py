@@ -72,6 +72,14 @@ class Engine:
 
         for fill in self.broker.check_pending(market_event):
             self.portfolio.record_fill(fill)
+            # il TP/SL ha chiuso la posizione: senza questo aggiornamento
+            # _current_position resterebbe sporco e un successivo EXIT
+            # aprirebbe un trade fantasma invece di non fare nulla
+            position_key = (fill.symbol, fill.source)
+            delta = fill.quantity if fill.direction == OrderDirection.BUY else -fill.quantity
+            self._current_position[position_key] = (
+                self._current_position.get(position_key, 0.0) + delta
+            )
             logger.info(
                 "PENDING RESOLVED [%s] %s %s qty=%.6f price=%.4f",
                 fill.source, fill.direction.value, fill.symbol, fill.quantity, fill.fill_price,
