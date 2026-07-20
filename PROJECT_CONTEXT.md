@@ -129,23 +129,114 @@ correzioni temporanee dentro un trend piu' ampio, sfavorevoli per costruzione.
 Andrebbe testato su periodi/asset con trend ribassista per capire se e' un
 problema strutturale della strategia o solo di questo campione.
 
+## Calibrazione su screenshot reali (2026-07-20)
+
+L'utente ha caricato 661 screenshot reali (Discord, 2021-2023) di trade BUD —
+sia desktop TradingView/Bybit con P&L visibile, sia mobile Binance con
+EMA5/10/60/223 esplicitamente etichettate. Analizzati tutti (17 batch da ~40
+immagini ciascuno, via subagent paralleli). Convergenza molto forte su alcuni
+punti, nonostante il campione sia quasi tutto crypto low-cap 1m e quasi tutto
+LONG (pochissimi short osservati: LUNA, MDX, REQ, OG — insufficienti per
+validare/smentire la simmetria long/short assunta da `BUDBidirectionalStrategy`).
+
+**Conferme dirette del codice attuale:**
+- EMA5/EMA10/EMA60/EMA223 sono esattamente le medie usate dall'utente (viste
+  etichettate esplicitamente in piu' screenshot mobile) — coerente con
+  `ema_fast_period=5, ema_stop_period=10, ema_trend_period=60`. EMA223 e'
+  sempre visibile sui grafici ma mai citata come riferimento di regola
+  (probabile solo contesto visivo di trend lunghissimo)
+- Trigger su tocco preciso di EMA10 ("ema 10 perfezione", label ricorrente in
+  decine di screenshot) — conferma la logica dell'innesco
+- Stop = EMA10 al setup — confermato esplicitamente e ripetutamente
+  ("Stop ema 10" scritto a mano su moltissimi screenshot), ma **molto piu'
+  stretto/aderente all'EMA10 di quanto un buffer ATR ampio suggerisca**
+- Filtro di trend: il prezzo e' sempre sopra l'EMA lenta al momento
+  dell'entrata; confermato anche su 2 asset non-crypto (azioni Telecom
+  Italia, UCG) con EMA piu' lenta (coerente col ramo EMA50 del codice)
+
+**Scoperte che CONTRADDICONO o estendono la logica attuale:**
+1. **Take profit — la scoperta piu' importante.** In NESSUNO dei 661
+   screenshot il TP e' un multiplo R fisso, e in NESSUNO e' visibile o
+   deducibile un riferimento a "prima EMA del timeframe superiore" (mai
+   mostrato un overlay multi-timeframe). Il pattern e' fortissimo e
+   ripetuto identico in tutti e 17 i batch: **il TP e' quasi sempre un
+   livello di prezzo/resistenza orizzontale preesistente** — uno swing
+   high/low precedente, "Max Giornata"/"Max ieri", un ATH, o una linea
+   disegnata a mano dall'utente — spesso con uscite scalate su piu' livelli
+   o gestione discrezionale (ordini modificati/annullati durante il trade).
+   I guadagni realizzati variano moltissimo (1.5%-16%+), incompatibili con
+   un R:R fisso. **`tp_r_multiple=2.0` va sostituito con una logica "target =
+   prossimo swing high/resistenza significativa sullo stesso timeframe"** —
+   piu' facile da implementare rispetto all'idea originale (non serve un
+   secondo DataFeed multi-timeframe), ma richiede un detector di swing
+   high/low sui dati gia' disponibili
+2. **"Bud Fintato"** (falso breakout) — concetto nominato esplicitamente
+   dall'utente in molti screenshot: un primo tentativo di rottura fallisce/
+   ritraccia, poi arriva la vera rottura che genera il trade. Non esiste
+   alcun meccanismo simile nel codice attuale (ne' in `bud_strategy.py` ne'
+   in `third_touch.py`, sebbene quest'ultimo — gia' scritto ma con
+   `require_third_touch=False` di default — copra una logica di "tocchi
+   multipli" concettualmente vicina)
+3. **Rilevamento BUD via livello testato piu' volte** — spesso il "Bud" non
+   e' una singola candela di espansione ma una **resistenza orizzontale
+   testata 2-3 volte** ("1,2,3" annotato a mano, "terzo tocco") prima della
+   rottura vera. La regola attuale (sequenza di >= 3 candele verdi con
+   ultima candela ad espansione >= 1.5x) coglie solo un sottoinsieme dei
+   casi reali — il pattern "singola candela spike enorme" e' altrettanto
+   comune, e il pattern "livello testato piu' volte" e' probabilmente il
+   piu' comune di tutti. `ThirdTouchDetector` (gia' nel codice, opzionale)
+   sembra il pezzo giusto per modellare questo, ma andrebbe reso piu'
+   centrale invece che un filtro opzionale aggiuntivo
+4. **Trigger meno rigido di quanto assunto**: l'entrata scatta spesso alla
+   rottura del massimo della base di appoggio (ordine stop-buy piazzato
+   esattamente li'), non necessariamente dopo una specifica "candela di
+   innesco a range contratto" — `innesco_contraction_ratio=0.5` puo' essere
+   troppo restrittivo e scartare setup validi che il fallback (BUD stesso
+   come trigger) dovrebbe gia' parzialmente coprire
+5. **Appoggio piu' vario**: da 1-2 candele fino a 15-40 in alcuni casi
+   (accumulo lungo prima dello spike) — `appoggio_max_candles=6` e' spesso
+   troppo stretto
+6. **Gestione dinamica non modellata**: alcuni screenshot mostrano stop
+   spostato a breakeven dopo esecuzione parziale, TP modificato/annullato e
+   ripiazzato durante il trade, ingressi scalati su piu' livelli
+   ("primo ingresso"/"secondo ingresso", piramidazione) — tutto assente
+   dall'infrastruttura attuale (Engine/Broker gestiscono un solo TP/SL
+   fissato all'apertura)
+7. Un'occorrenza isolata mostra lo stop ancorato a EMA60 invece che EMA10 —
+   probabile eccezione/caso limite, non abbastanza frequente da cambiare la
+   regola di default
+
+**Nota sul campione**: quasi tutti gli screenshot mostrano trade vincenti
+(probabile selection bias — l'utente condivide su Discord soprattutto le
+vincite), quindi non e' possibile stimare un win rate realistico da questi
+dati. I backtest gia' fatti (vedi sopra, PaperJournalBroker) restano l'unica
+fonte per quello.
+
 ## TODO / prossimi passi aperti
 
-1. **Calibrazione sui veri screenshot dell'utente** — questo e' IL prossimo passo,
-   l'utente deve ancora scaricarli. Finche' non e' fatto, tutti i parametri sopra
-   sono placeholder
-2. **TP multi-timeframe reale** ("prima EMA sul TF superiore") — attualmente solo
-   R-multiple fisso, e' una semplificazione nota
-3. **Commissioni/slippage nel PaperJournalBroker** — attualmente assenti, i
+1. **Implementare TP basato su swing high/low** (prossima resistenza/supporto
+   sullo stesso timeframe) al posto del multiplo R fisso — la modifica di
+   calibrazione piu' importante emersa dall'analisi degli screenshot, vedi
+   sopra
+2. **Modellare "Bud Fintato"** (tolleranza a un primo falso breakout prima
+   del trigger valido) — da valutare se estendere `ThirdTouchDetector` o
+   scrivere un meccanismo dedicato
+3. Ricalibrare `bud_lookback_min` (valutare soglia piu' bassa/flessibile,
+   dato che molti BUD reali sono singola candela spike) e
+   `appoggio_max_candles` (valutare range piu' ampio)
+4. **Commissioni/slippage nel PaperJournalBroker** — attualmente assenti, i
    risultati sono ottimistici rispetto alla realta'
-4. **Verificare l'ipotesi long/short sbilanciato** su altri periodi/asset
-5. **ActivTrades come broker live**: verificato che offre API solo per clienti
+5. **Verificare l'ipotesi long/short sbilanciato** su altri periodi/asset —
+   il campione screenshot non aiuta qui (quasi solo long)
+6. Valutare se modellare gestione dinamica (stop a breakeven, TP scalato,
+   ingressi piramidati) — feature grossa, probabilmente fuori scope per ora
+7. **ActivTrades come broker live**: verificato che offre API solo per clienti
    istituzionali, via WebSocket con client .NET ufficiale (nessun supporto Python
    documentato) — se si vuole andare live con questo broker serve un client
    custom, non e' un drop-in come CCXTBroker. Alternative piu' semplici da
    integrare: altri exchange crypto via ccxt, o broker con REST nativa
    (Alpaca, Interactive Brokers)
-6. Ordini stop simulati a chiusura barra, non intrabar — approssimazione presente
+8. Ordini stop simulati a chiusura barra, non intrabar — approssimazione presente
    in tutto il sistema, da tenere a mente specialmente sui timeframe piu' bassi
 
 ## Come rigenerare i dati usati nei test (non versionati nel repo)
