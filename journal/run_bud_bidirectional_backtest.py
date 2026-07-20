@@ -50,6 +50,9 @@ def main():
         atr_period=14,
         stop_buffer_atr_mult=0.25,
         tp_r_multiple=2.0,
+        # use_swing_tp=True per provare il TP a swing high calibrato sugli
+        # screenshot reali (vedi PROJECT_CONTEXT.md) — di default spento,
+        # nei backtest fatti finora peggiora il PnL netto rispetto al 2R fisso
     )
     risk_manager = FixedRiskPerTradeManager(risk_per_trade=10.0, tp_r_multiple=2.0)
     broker = PaperJournalBroker(initial_capital=1000.0)

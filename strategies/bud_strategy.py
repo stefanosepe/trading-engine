@@ -14,9 +14,13 @@ multiplo R, salvo diversa configurazione).
 
 SEMPLIFICAZIONI CONSAPEVOLI rispetto alla descrizione originale (da
 affinare in iterazioni successive, segnalate esplicitamente):
-- Il Take Profit "prima EMA sul timeframe superiore" NON e' implementato:
-  richiederebbe un secondo DataFeed sincronizzato su un timeframe piu'
-  alto. Per ora si usa sempre il multiplo R (tp_r_multiple) come TP.
+- Il Take Profit "prima EMA sul timeframe superiore" ipotizzato inizialmente
+  NON e' mai stato confermato dalla calibrazione su 661 screenshot reali
+  (vedi PROJECT_CONTEXT.md): in nessuno screenshot il TP era un'EMA di
+  timeframe superiore. Il pattern osservato e' invece "prossimo swing
+  high/resistenza sullo stesso timeframe", modellato qui da
+  SwingLevelTracker. Se nessun livello e' disponibile (fase iniziale della
+  serie storica), si ricade sul multiplo R (tp_r_multiple) come fallback.
 - La conferma via order book non e' modellata (i dati OHLC non la
   contengono): il rilevamento si basa solo su struttura delle candele.
 - Solo lato LONG (la logica descritta era per un contesto rialzista;
@@ -24,11 +28,17 @@ affinare in iterazioni successive, segnalate esplicitamente):
 - L'entrata viene valutata alla chiusura della barra di rottura, non
   intrabar: e' la stessa approssimazione gia' presente nel resto
   dell'infrastruttura (BacktestBroker fillava a "close").
+- Pattern osservati ma NON implementati (vedi PROJECT_CONTEXT.md): "Bud
+  Fintato" (tolleranza a un primo falso breakout prima del trigger valido)
+  e gestione dinamica del trade (stop a breakeven, TP scalato, ingressi
+  piramidati) — richiedono modifiche piu' ampie all'infrastruttura
+  (Engine/Broker gestiscono oggi un solo TP/SL fissato all'apertura).
 """
 from dataclasses import dataclass, field
 
 from core.events import MarketEvent, SignalEvent, SignalType
 from strategies.base import Strategy
+from strategies.swing_levels import SwingLevelTracker
 from strategies.third_touch import ThirdTouchDetector
 
 
@@ -74,6 +84,9 @@ class BUDStrategy(Strategy):
         atr_period: int = 14,
         stop_buffer_atr_mult: float = 0.25,
         tp_r_multiple: float = 2.0,
+        use_swing_tp: bool = False,
+        swing_pivot_lookback: int = 3,
+        swing_max_active_levels: int = 20,
         require_third_touch: bool = False,
         third_touch_pivot_lookback: int = 3,
         third_touch_tolerance_pct: float = 0.005,
@@ -86,17 +99,41 @@ class BUDStrategy(Strategy):
         mai controtrend. None = filtro disattivato. Valore tipico: 60 per
         crypto, 50 per azionario/indici/commodity.
 
+        bud_lookback_min / appoggio_max_candles: gli screenshot suggerivano
+        valori piu' bassi/ampi (i BUD reali sono spesso 1-2 candele prima
+        dello spike, gli appoggi arrivano spesso a 8-10+ candele) ma un test
+        A/B su BTC/USDT 1h (2017-2019 e un sotto-periodo 2019) ha dato
+        risultati incoerenti/peggiorativi cambiando questi default (vedi
+        PROJECT_CONTEXT.md) — quindi restano ai valori originali, gia'
+        validati dai backtest storici. Restano parametri liberi da esplorare
+        con un vero parameter sweep, non solo impressioni qualitative dagli
+        screenshot.
+
+        use_swing_tp: se True, il take profit e' il prossimo swing high non
+        ancora rotto sopra il prezzo d'entrata (SwingLevelTracker) invece del
+        multiplo R fisso — e' il comportamento osservato quasi ovunque negli
+        screenshot reali (mai un multiplo R fisso, mai un'EMA di timeframe
+        superiore). PERO' un backtest su BTC/USDT 1h mostra che la versione
+        "prendi sempre il livello piu' vicino" alza il win rate (fino al
+        63% su alcuni periodi) ma abbassa il PnL netto rispetto al multiplo
+        2R fisso, perche' taglia corto i trade migliori — gli screenshot
+        mostrano spesso uscite scalate o target estesi oltre il primo
+        livello, comportamento non modellato qui. Default a False (fallback
+        sicuro sul multiplo R) finche' non si affina questa logica (vedi
+        PROJECT_CONTEXT.md); il meccanismo resta disponibile e testato per
+        chi vuole sperimentarci.
+
         require_third_touch: se True, l'entrata BUD e' un filtro OBBLIGATORIO
         — si entra SOLO se il trigger di rottura e' vicino a un livello che
         ha gia' 2 tocchi confermati (in avvicinamento al terzo) o appena
         arrivato al terzo, secondo ThirdTouchDetector. Nessuna confluenza =
         nessun segnale, anche se il resto del pattern BUD e' valido.
 
-        Nota sul lato short (via BUDBidirectionalStrategy): il detector
-        interno usa sempre direction="resistance" nel proprio spazio dati
-        — per l'istanza "short", che riceve dati gia' ribaltati dal
-        wrapper, questo diventa automaticamente un supporto nello spazio
-        reale, esattamente come per il resto della logica BUD.
+        Nota sul lato short (via BUDBidirectionalStrategy): sia il detector
+        del terzo tocco sia SwingLevelTracker usano sempre lo spazio dati
+        "long"/resistenza — per l'istanza "short", che riceve dati gia'
+        ribaltati dal wrapper, questo diventa automaticamente supporto nello
+        spazio reale, esattamente come per il resto della logica BUD.
         """
         self.ema_fast_period = ema_fast_period
         self.ema_stop_period = ema_stop_period
@@ -109,6 +146,7 @@ class BUDStrategy(Strategy):
         self.atr_period = atr_period
         self.stop_buffer_atr_mult = stop_buffer_atr_mult
         self.tp_r_multiple = tp_r_multiple
+        self.use_swing_tp = use_swing_tp
         self.require_third_touch = require_third_touch
         self.third_touch_lookback_bars = third_touch_lookback_bars
         self.third_touch_tolerance_pct = third_touch_tolerance_pct
@@ -135,6 +173,14 @@ class BUDStrategy(Strategy):
             if require_third_touch
             else None
         )
+        self._swing_tracker = (
+            SwingLevelTracker(
+                pivot_lookback=swing_pivot_lookback,
+                max_active_levels=swing_max_active_levels,
+            )
+            if use_swing_tp
+            else None
+        )
         # ultima confluenza vista per simbolo: (livello_prezzo, indice_barra)
         self._last_confluence: dict[str, tuple[float, int]] = {}
 
@@ -149,6 +195,8 @@ class BUDStrategy(Strategy):
         self._last_confluence.clear()
         if self._third_touch is not None:
             self._third_touch.reset()
+        if self._swing_tracker is not None:
+            self._swing_tracker.reset()
 
     # ------------------------------------------------------------------
 
@@ -157,6 +205,8 @@ class BUDStrategy(Strategy):
         candle = _Candle(event.timestamp, event.open, event.high, event.low, event.close)
 
         self._update_indicators(symbol, candle)
+        if self._swing_tracker is not None:
+            self._swing_tracker.on_market_event(event)
 
         min_bars = max(self.ema_stop_period, self.atr_period, self.ema_trend_period or 0) + 1
         self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
@@ -314,12 +364,18 @@ class BUDStrategy(Strategy):
         atr = self._atr[symbol]
         stop_price = (state.stop_ema_at_setup or ema_stop) - self.stop_buffer_atr_mult * atr
 
+        take_profit_price = None
+        if self._swing_tracker is not None:
+            take_profit_price = self._swing_tracker.next_resistance_above(symbol, entry_price)
+        # se nessun livello e' disponibile, take_profit_price resta None e il
+        # RiskManager ricade sul multiplo tp_r_multiple (vedi FixedRiskPerTradeManager)
+
         signal = SignalEvent(
             symbol=symbol,
             timestamp=candle.timestamp,
             signal_type=SignalType.LONG,
             stop_price=stop_price,
-            take_profit_price=None,  # calcolato dal RiskManager via tp_r_multiple
+            take_profit_price=take_profit_price,
         )
 
         self._reset_to_scanning(state, candle)

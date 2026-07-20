@@ -212,18 +212,58 @@ vincite), quindi non e' possibile stimare un win rate realistico da questi
 dati. I backtest gia' fatti (vedi sopra, PaperJournalBroker) restano l'unica
 fonte per quello.
 
+## Implementazione della calibrazione e verifica via backtest (2026-07-20)
+
+Fatto un primo giro di implementazione + verifica empirica su BTC/USDT 1h
+(dataset "short" ~4 mesi 2019, 17-34 trade a seconda dei parametri; dataset
+"full" 2017-2019, 129-301 trade) per non fidarsi ciecamente delle impressioni
+qualitative dagli screenshot. Risultati:
+
+- **`SwingLevelTracker` (nuovo file `strategies/swing_levels.py`) +
+  `use_swing_tp` in `BUDStrategy`**: implementato e funzionante — quando
+  attivo, il take profit e' il prossimo swing high non ancora rotto sopra
+  l'entrata invece del multiplo R fisso, esattamente come osservato negli
+  screenshot. PERO' il backtest mostra che la versione "prendi sempre il
+  livello piu' vicino" alza molto il win rate (fino al 63% su alcuni
+  sotto-periodi, dataset full: 40%->64% con `swing_pivot_lookback=3`) ma
+  **abbassa il PnL netto** rispetto al 2R fisso (dataset full: +330 col 2R
+  fisso vs +172/+100/+80 a seconda di `swing_pivot_lookback` 3/8/20 con lo
+  swing TP) — taglia corto i trade migliori. Coerente con quanto notato negli
+  screenshot stessi: spesso ci sono uscite scalate o target estesi oltre il
+  primo livello (misura/estensione), comportamento che qui non e' modellato.
+  **Lasciato `use_swing_tp=False` di default** (fallback sicuro sul 2R),
+  il meccanismo resta disponibile e testato per chi vuole sperimentarci o
+  affinarlo (es. combinarlo con un'estensione oltre il primo livello, o
+  uscite parziali)
+- **Ricalibrazione di `bud_lookback_min`/`appoggio_max_candles`**: provato ad
+  abbassare/allargare come suggerivano gli screenshot, ma il risultato e'
+  stato incoerente tra i due dataset (es. `bud_lookback_min=2` da solo:
+  -40 sul dataset corto ma +710 sul dataset lungo; `appoggio_max_candles=10`
+  peggiora in entrambi) — **troppo rumoroso per trarre conclusioni da un
+  singolo asset/venue**, quindi i default restano quelli originali (3 e 6),
+  gia' validati dai backtest storici in questo documento. Da rivisitare con
+  un vero parameter sweep multi-asset se si vuole insistere su questa strada
+- Non implementati in questo giro (troppo ampi per una singola iterazione,
+  richiedono modifiche architetturali piu' profonde): **"Bud Fintato"**
+  (tolleranza a un primo falso breakout), **rilevamento BUD via livello
+  multi-touch** come meccanismo primario (c'e' gia' `ThirdTouchDetector` ma
+  resta opzionale/`require_third_touch=False`), **gestione dinamica del
+  trade** (breakeven, TP scalato, ingressi piramidati — richiede che
+  Engine/Broker sappiano gestire piu' di un TP/SL fissato all'apertura)
+
 ## TODO / prossimi passi aperti
 
-1. **Implementare TP basato su swing high/low** (prossima resistenza/supporto
-   sullo stesso timeframe) al posto del multiplo R fisso — la modifica di
-   calibrazione piu' importante emersa dall'analisi degli screenshot, vedi
-   sopra
+1. **Affinare la logica di TP a swing high** prima di renderla default: idee
+   dagli screenshot da provare — estensione oltre il primo livello quando il
+   momentum e' forte, uscite parziali/scalate, o combinare swing TP con un
+   floor minimo in R (es. `max(swing_target, entry + 1.0R)`)
 2. **Modellare "Bud Fintato"** (tolleranza a un primo falso breakout prima
    del trigger valido) — da valutare se estendere `ThirdTouchDetector` o
    scrivere un meccanismo dedicato
-3. Ricalibrare `bud_lookback_min` (valutare soglia piu' bassa/flessibile,
-   dato che molti BUD reali sono singola candela spike) e
-   `appoggio_max_candles` (valutare range piu' ampio)
+3. Un vero parameter sweep (multi-asset, multi-periodo) su
+   `bud_lookback_min`/`appoggio_max_candles`/`bud_expansion_mult` invece di
+   un singolo A/B su BTC — il tentativo fatto in questo giro non ha dato
+   segnale pulito
 4. **Commissioni/slippage nel PaperJournalBroker** — attualmente assenti, i
    risultati sono ottimistici rispetto alla realta'
 5. **Verificare l'ipotesi long/short sbilanciato** su altri periodi/asset —
@@ -244,8 +284,14 @@ fonte per quello.
 ```bash
 # BTC/USDT 1h (da GitHub, dataset cryptobigbro/binance-BTCUSDT)
 curl -sL "https://raw.githubusercontent.com/cryptobigbro/binance-BTCUSDT/master/binance-BTCUSDT-1h.csv" -o btc_raw.csv
-# poi convertire con pandas al formato timestamp,open,high,low,close,volume
-# (vedi cronologia comandi bash in questa sessione per lo script esatto)
+python3 -c "
+import pandas as pd
+df = pd.read_csv('btc_raw.csv')
+df['timestamp'] = pd.to_datetime(df['open_timestamp_utc'], unit='s')
+out = df[['timestamp','open','high','low','close','volume']]
+out[(out['timestamp'] >= '2019-01-01') & (out['timestamp'] < '2019-05-01')].to_csv('data/btcusdt_1h.csv', index=False)
+out[(out['timestamp'] >= '2017-08-01') & (out['timestamp'] < '2019-11-01')].to_csv('data/btcusdt_1h_full.csv', index=False)
+"
 
 # Gold/Nasdaq100/Crude Oil 2019 1h/4h (da GitHub, FutureSharks/financial-data,
 # dati minuto Oanda ricampionati)
