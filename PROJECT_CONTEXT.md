@@ -470,6 +470,67 @@ for freq, label in [('5min','5m'), ('30min','30m')]:
 "
 ```
 
+## Filtro "prossimita' massimo/minimo del giorno precedente" (2026-07-21)
+
+Su richiesta esplicita dell'utente: il segnale long deve scattare in
+prossimita' del massimo del giorno precedente (calendario UTC), il segnale
+short in prossimita' del minimo di ieri. Implementato in `bud_strategy.py`:
+- `_update_prev_day_high`: aggiorna il massimo del giorno in corso e, al
+  cambio di giorno, congela quel massimo in `_prev_day_high` — nessun
+  lookahead (il massimo del giorno N e' disponibile solo dal giorno N+1)
+- Nuovi parametri: `require_prev_day_extreme` (default False, opt-in) e
+  `prev_day_extreme_proximity_pct` (default 0.01 = 1%)
+- Gate in `_fire_entry`, stesso pattern di `require_third_touch`: se il
+  prezzo di rottura e' oltre la tolleranza dal massimo di ieri, niente
+  segnale. Simmetria long/short automatica via il meccanismo di ribaltamento
+  dati gia' esistente (nessun codice speciale per lo short, come per swing
+  TP e terzo tocco)
+
+**Risultati (BTC/USDT, costi realistici 0.1%/lato + 0.05% slippage):**
+
+Prima scoperta: la tolleranza di default (1%) e' troppo larga — **piu' si
+stringe, meglio va**, in modo consistente su tutti i timeframe testati (5m,
+30m, 1h; provato fino a 0.15%). Con tolleranza larga il filtro non aggiunge
+molto sopra il baseline; con tolleranza stretta (0.2-0.3%) filtra per
+davvero i setup che sono *veramente* a ridosso del livello.
+
+| TF | Periodo | Config | n | Win rate | PnL |
+|---|---|---|---|---|---|
+| 5m | lungo | baseline | 2057 | 28.4% | -16.953 |
+| 5m | lungo | third_touch | 769 | 29.4% | -5.787 |
+| 5m | lungo | prev_day 0.3% + third_touch | 48 | 33.3% | **-283** |
+| 30m | lungo | baseline | 316 | 38.3% | -695 |
+| 30m | lungo | prev_day 0.2% | 37 | 35.1% | -159 |
+| **1h** | **lungo** | **prev_day 0.2%** | **28** | **46.4%** | **+33** |
+| 1h | lungo | prev_day 0.15% | 24 | 45.8% | +33 |
+| 1h | lungo | prev_day 0.25% | 31 | 45.2% | +24 |
+| 1h | lungo | prev_day 0.3% | 33 | 42.4% | -4 |
+
+**Primo risultato netto positivo dell'intera sessione**: su 1h (2017-2019),
+tolleranza 0.15-0.25% da' win rate 45-46% (ben sopra il 33.3% di breakeven
+per 2R) e PnL positivo, stabile su un range di soglie (non un singolo
+numero fortunato) — segnale piu' credibile dei singoli picchi isolati visti
+finora. ATTENZIONE pero': stesso filtro sullo stesso TF ma sul dataset
+corto (4 mesi 2019, n=7) e' negativo — campione troppo piccolo per
+confermare, e il dataset lungo pesa quasi tutto il 2017-2018 (bull market
+BTC), quindi il risultato potrebbe non generalizzare a mercati laterali o
+ribassisti. Su 5m/30m il filtro riduce le perdite ma non le azzera.
+
+**Asimmetria long/short controllata e SCARTATA come falso segnale**: un
+primo test su 30m mostrava lo short (vicino al minimo di ieri) nettamente
+migliore del long (66.7%/+138 vs 11.8%/-110 di win rate/pnl) — ma lo stesso
+confronto su 5m e 1h mostra l'OPPOSTO (long migliore dello short). Con
+campioni di 17-20 trade per lato, questa oscillazione e' quasi certamente
+rumore statistico, non un effetto strutturale reale — **non e' stata
+introdotta nessuna asimmetria hard-coded nel filtro** per questo motivo,
+resta simmetrico come tutto il resto della logica BUD.
+
+**Prossimo passo naturale**: verificare la config `prev_day 0.15-0.25%` su
+1h anche su altri asset (Gold/Nasdaq/Oil, gia' nel repo) e su BTC 2022-2025
+(dataset `btc_recent` gia' scaricato in una sessione precedente, non
+riverificato in questo giro) per capire se il segnale regge fuori dal bull
+market 2017-2019 o e' specifico di quel regime.
+
 ## Runner disponibili in journal/
 
 - `run_journal_backtest.py` / `run_journal_live.py` — journal generico con

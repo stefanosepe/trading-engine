@@ -93,6 +93,8 @@ class BUDStrategy(Strategy):
         third_touch_tolerance_pct: float = 0.005,
         third_touch_approach_pct: float = 0.01,
         third_touch_lookback_bars: int = 20,
+        require_prev_day_extreme: bool = False,
+        prev_day_extreme_proximity_pct: float = 0.01,
     ):
         """
         ema_trend_period: se valorizzata, aggiunge il filtro di trend — si
@@ -138,11 +140,21 @@ class BUDStrategy(Strategy):
         arrivato al terzo, secondo ThirdTouchDetector. Nessuna confluenza =
         nessun segnale, anche se il resto del pattern BUD e' valido.
 
+        require_prev_day_extreme: se True, l'entrata scatta SOLO se il
+        prezzo di rottura e' entro `prev_day_extreme_proximity_pct` dal
+        massimo del giorno precedente (calendario UTC) — nello spazio "long"
+        della classe, che per l'istanza short (dati ribaltati) diventa
+        automaticamente il minimo del giorno precedente nello spazio reale,
+        esattamente come richiesto ("vicino al massimo di ieri se long,
+        vicino al minimo di ieri se short"). Nessun massimo/minimo di ieri
+        ancora disponibile (primo giorno di storico) = nessun segnale.
+
         Nota sul lato short (via BUDBidirectionalStrategy): sia il detector
-        del terzo tocco sia SwingLevelTracker usano sempre lo spazio dati
-        "long"/resistenza — per l'istanza "short", che riceve dati gia'
-        ribaltati dal wrapper, questo diventa automaticamente supporto nello
-        spazio reale, esattamente come per il resto della logica BUD.
+        del terzo tocco sia SwingLevelTracker e il tracker del giorno
+        precedente usano sempre lo spazio dati "long"/resistenza — per
+        l'istanza "short", che riceve dati gia' ribaltati dal wrapper,
+        questo diventa automaticamente supporto nello spazio reale,
+        esattamente come per il resto della logica BUD.
         """
         self.ema_fast_period = ema_fast_period
         self.ema_stop_period = ema_stop_period
@@ -160,6 +172,8 @@ class BUDStrategy(Strategy):
         self.require_third_touch = require_third_touch
         self.third_touch_lookback_bars = third_touch_lookback_bars
         self.third_touch_tolerance_pct = third_touch_tolerance_pct
+        self.require_prev_day_extreme = require_prev_day_extreme
+        self.prev_day_extreme_proximity_pct = prev_day_extreme_proximity_pct
 
         self._ema_fast_alpha = 2 / (ema_fast_period + 1)
         self._ema_stop_alpha = 2 / (ema_stop_period + 1)
@@ -194,6 +208,11 @@ class BUDStrategy(Strategy):
         # ultima confluenza vista per simbolo: (livello_prezzo, indice_barra)
         self._last_confluence: dict[str, tuple[float, int]] = {}
 
+        # tracker massimo/minimo del giorno precedente (calendario UTC)
+        self._current_day: dict[str, object] = {}
+        self._current_day_high: dict[str, float] = {}
+        self._prev_day_high: dict[str, float | None] = {}
+
     def reset(self) -> None:
         self._ema_fast.clear()
         self._ema_stop.clear()
@@ -203,6 +222,9 @@ class BUDStrategy(Strategy):
         self._bars_seen.clear()
         self._state.clear()
         self._last_confluence.clear()
+        self._current_day.clear()
+        self._current_day_high.clear()
+        self._prev_day_high.clear()
         if self._third_touch is not None:
             self._third_touch.reset()
         if self._swing_tracker is not None:
@@ -217,15 +239,18 @@ class BUDStrategy(Strategy):
         self._update_indicators(symbol, candle)
         self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
 
-        # i tracker di struttura (swing/terzo tocco) osservano TUTTE le barre
-        # dalla prima: non dipendono dalle EMA e i livelli formati durante il
-        # warm-up degli indicatori sono informazione legittima e preziosa
+        # i tracker di struttura (swing/terzo tocco/giorno precedente)
+        # osservano TUTTE le barre dalla prima: non dipendono dalle EMA e i
+        # livelli formati durante il warm-up degli indicatori sono
+        # informazione legittima e preziosa
         if self._swing_tracker is not None:
             self._swing_tracker.on_market_event(event)
         if self._third_touch is not None:
             info = self._third_touch.on_market_event(event)
             if info is not None and (info.approaching_third or info.third_touch_confirmed):
                 self._last_confluence[symbol] = (info.level_price, self._bars_seen[symbol])
+        if self.require_prev_day_extreme:
+            self._update_prev_day_high(symbol, candle)
 
         min_bars = max(self.ema_stop_period, self.atr_period, self.ema_trend_period or 0) + 1
         if self._bars_seen[symbol] < min_bars:
@@ -276,6 +301,28 @@ class BUDStrategy(Strategy):
         atr_alpha = 1 / self.atr_period
         self._atr[symbol] = true_range * atr_alpha + self._atr[symbol] * (1 - atr_alpha)
         self._prev_close[symbol] = candle.close
+
+    # ------------------------------------------------------------------
+
+    def _update_prev_day_high(self, symbol: str, candle: _Candle) -> None:
+        """Aggiorna il massimo del giorno in corso e, al cambio di giorno
+        (calendario UTC del timestamp della barra), congela il massimo del
+        giorno appena concluso in _prev_day_high. Nessun lookahead: il
+        massimo del giorno N e' disponibile solo a partire dal giorno N+1."""
+        day = candle.timestamp.date() if hasattr(candle.timestamp, "date") else candle.timestamp
+
+        if symbol not in self._current_day:
+            self._current_day[symbol] = day
+            self._current_day_high[symbol] = candle.high
+            self._prev_day_high[symbol] = None
+            return
+
+        if day != self._current_day[symbol]:
+            self._prev_day_high[symbol] = self._current_day_high[symbol]
+            self._current_day[symbol] = day
+            self._current_day_high[symbol] = candle.high
+        else:
+            self._current_day_high[symbol] = max(self._current_day_high[symbol], candle.high)
 
     # ------------------------------------------------------------------
 
@@ -377,6 +424,21 @@ class BUDStrategy(Strategy):
         ):
             self._reset_to_scanning(state, candle)
             return None
+
+        # filtro massimo/minimo del giorno precedente: obbligatorio se
+        # richiesto, l'entrata deve avvenire in prossimita' dell'estremo di
+        # ieri (massimo per long, minimo per short nello spazio reale)
+        if self.require_prev_day_extreme:
+            prev_high = self._prev_day_high.get(symbol)
+            if prev_high is None:
+                self._reset_to_scanning(state, candle)
+                return None
+            # abs() al denominatore: obbligatorio per il lato short (prezzi
+            # ribaltati/negativi nello spazio del wrapper bidirezionale)
+            distance_pct = abs(entry_price - prev_high) / abs(prev_high)
+            if distance_pct > self.prev_day_extreme_proximity_pct:
+                self._reset_to_scanning(state, candle)
+                return None
 
         atr = self._atr[symbol]
         stop_price = (state.stop_ema_at_setup or ema_stop) - self.stop_buffer_atr_mult * atr
