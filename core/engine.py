@@ -80,6 +80,7 @@ class Engine:
             self._current_position[position_key] = (
                 self._current_position.get(position_key, 0.0) + delta
             )
+            self._notify_fill(fill)
             logger.info(
                 "PENDING RESOLVED [%s] %s %s qty=%.6f price=%.4f",
                 fill.source, fill.direction.value, fill.symbol, fill.quantity, fill.fill_price,
@@ -129,8 +130,19 @@ class Engine:
 
         delta = fill.quantity if fill.direction == OrderDirection.BUY else -fill.quantity
         self._current_position[position_key] = current_qty + delta
+        self._notify_fill(fill)
 
         logger.info(
             "FILL [%s] %s %s qty=%.6f price=%.4f commission=%.4f",
             signal.source, fill.direction.value, symbol, fill.quantity, fill.fill_price, fill.commission,
         )
+
+    def _notify_fill(self, fill) -> None:
+        # avvisa la strategia che ha generato l'ordine (stesso source) che
+        # un suo fill e' avvenuto — apertura o chiusura, TP/SL o EXIT. Solo
+        # le strategie che implementano on_fill (default no-op) se ne
+        # accorgono; serve a chi ha bisogno di sapere se una posizione e'
+        # ancora aperta bar dopo bar (es. invalidazione strutturale).
+        for strategy, strategy_id in zip(self.strategies, self._strategy_ids):
+            if strategy_id == fill.source:
+                strategy.on_fill(fill)

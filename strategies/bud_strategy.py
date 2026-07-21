@@ -31,12 +31,18 @@ affinare in iterazioni successive, segnalate esplicitamente):
 - Pattern osservati ma NON implementati (vedi PROJECT_CONTEXT.md): "Bud
   Fintato" (tolleranza a un primo falso breakout prima del trigger valido)
   e gestione dinamica del trade (stop a breakeven, TP scalato, ingressi
-  piramidati) — richiedono modifiche piu' ampie all'infrastruttura
-  (Engine/Broker gestiscono oggi un solo TP/SL fissato all'apertura).
+  piramidati) — richiedono modifiche piu' ampie all'infrastruttura.
+- Invalidazione strutturale (`invalidate_on_close_below_entry_level`) e TP
+  fisso in percentuale (`fixed_tp_pct`) SONO implementati (vedi sotto,
+  aggiunti dopo l'analisi manuale di un trade reale con l'utente) — la
+  prima e' l'unico pezzo di "gestione dinamica del trade" oggi presente:
+  richiede che la strategia sappia se una posizione e' ancora aperta bar
+  dopo bar, tramite `on_fill` (vedi Strategy.on_fill in strategies/base.py
+  e Engine._notify_fill).
 """
 from dataclasses import dataclass, field
 
-from core.events import MarketEvent, SignalEvent, SignalType
+from core.events import FillEvent, MarketEvent, OrderDirection, SignalEvent, SignalType
 from strategies.base import Strategy
 from strategies.swing_levels import SwingLevelTracker
 from strategies.third_touch import ThirdTouchDetector
@@ -95,6 +101,8 @@ class BUDStrategy(Strategy):
         third_touch_lookback_bars: int = 20,
         require_prev_day_extreme: bool = False,
         prev_day_extreme_proximity_pct: float = 0.01,
+        fixed_tp_pct: float | None = None,
+        invalidate_on_close_below_entry_level: bool = False,
     ):
         """
         ema_trend_period: se valorizzata, aggiunge il filtro di trend — si
@@ -149,12 +157,35 @@ class BUDStrategy(Strategy):
         vicino al minimo di ieri se short"). Nessun massimo/minimo di ieri
         ancora disponibile (primo giorno di storico) = nessun segnale.
 
+        fixed_tp_pct: se valorizzato, il take profit e' un semplice
+        `entry_price * (1 + fixed_tp_pct)` — ha priorita' su use_swing_tp
+        (se entrambi valorizzati, vince fixed_tp_pct). Nato dall'analisi
+        manuale di un trade reale con l'utente: un target vicino e fisso
+        (es. 1%) colto spesso, invece di inseguire uno swing high specifico.
+
+        invalidate_on_close_below_entry_level: se True, dopo l'entrata la
+        strategia continua a monitorare la posizione bar dopo bar (tramite
+        `on_fill`, che le dice quando l'entrata e' stata davvero eseguita e
+        quando la posizione si e' chiusa) e, se una barra CHIUDE sotto il
+        livello di rottura usato per l'entrata (il trigger, non lo stop),
+        emette un EXIT anticipato — invece di aspettare che il prezzo
+        raggiunga lo stop pieno. Un semplice sfioramento intrabar sotto il
+        livello, seguito da una chiusura di nuovo sopra, NON invalida (si
+        controlla solo il CLOSE di ogni barra, coerente col resto del
+        sistema che non modella l'intrabar). Nato dalla stessa analisi
+        manuale: "una volta rotto il livello, il prezzo deve tenere sopra
+        quel livello (e nel caso osservato anche sopra EMA5) — se rientra
+        sotto e chiude li', meglio uscire in perdita piccola che aspettare
+        lo stop pieno".
+
         Nota sul lato short (via BUDBidirectionalStrategy): sia il detector
         del terzo tocco sia SwingLevelTracker e il tracker del giorno
         precedente usano sempre lo spazio dati "long"/resistenza — per
         l'istanza "short", che riceve dati gia' ribaltati dal wrapper,
         questo diventa automaticamente supporto nello spazio reale,
-        esattamente come per il resto della logica BUD.
+        esattamente come per il resto della logica BUD. Il wrapper si
+        occupa anche di inoltrare i fill con direzione ribaltata (vedi
+        BUDBidirectionalStrategy.on_fill).
         """
         self.ema_fast_period = ema_fast_period
         self.ema_stop_period = ema_stop_period
@@ -174,6 +205,8 @@ class BUDStrategy(Strategy):
         self.third_touch_tolerance_pct = third_touch_tolerance_pct
         self.require_prev_day_extreme = require_prev_day_extreme
         self.prev_day_extreme_proximity_pct = prev_day_extreme_proximity_pct
+        self.fixed_tp_pct = fixed_tp_pct
+        self.invalidate_on_close_below_entry_level = invalidate_on_close_below_entry_level
 
         self._ema_fast_alpha = 2 / (ema_fast_period + 1)
         self._ema_stop_alpha = 2 / (ema_stop_period + 1)
@@ -213,6 +246,13 @@ class BUDStrategy(Strategy):
         self._current_day_high: dict[str, float] = {}
         self._prev_day_high: dict[str, float | None] = {}
 
+        # invalidazione strutturale: livello che deve tenere, impostato su
+        # on_fill quando l'entrata viene davvero eseguita (non al momento
+        # del segnale, per non tracciare posizioni mai aperte se il
+        # RiskManager rifiuta l'ordine)
+        self._pending_entry_level: dict[str, float] = {}
+        self._open_position_level: dict[str, float] = {}
+
     def reset(self) -> None:
         self._ema_fast.clear()
         self._ema_stop.clear()
@@ -224,6 +264,8 @@ class BUDStrategy(Strategy):
         self._last_confluence.clear()
         self._current_day.clear()
         self._current_day_high.clear()
+        self._pending_entry_level.clear()
+        self._open_position_level.clear()
         self._prev_day_high.clear()
         if self._third_touch is not None:
             self._third_touch.reset()
@@ -238,6 +280,20 @@ class BUDStrategy(Strategy):
 
         self._update_indicators(symbol, candle)
         self._bars_seen[symbol] = self._bars_seen.get(symbol, 0) + 1
+
+        # invalidazione strutturale: se una posizione risulta aperta (via
+        # on_fill) e questa barra CHIUDE sotto il livello di rottura usato
+        # per l'entrata, esci subito invece di aspettare lo stop pieno.
+        # Priorita' su tutto il resto: se scatta, non si valuta altro
+        # questa barra (coerente col fatto che l'Engine comunque non
+        # aprirebbe un nuovo trade finche' la posizione risulta aperta).
+        if self.invalidate_on_close_below_entry_level and symbol in self._open_position_level:
+            level = self._open_position_level[symbol]
+            if candle.close < level:
+                del self._open_position_level[symbol]
+                return SignalEvent(
+                    symbol=symbol, timestamp=candle.timestamp, signal_type=SignalType.EXIT
+                )
 
         # i tracker di struttura (swing/terzo tocco/giorno precedente)
         # osservano TUTTE le barre dalla prima: non dipendono dalle EMA e i
@@ -444,7 +500,11 @@ class BUDStrategy(Strategy):
         stop_price = (state.stop_ema_at_setup or ema_stop) - self.stop_buffer_atr_mult * atr
 
         take_profit_price = None
-        if self._swing_tracker is not None:
+        if self.fixed_tp_pct is not None:
+            # priorita' massima: target fisso in %, indipendente dalla
+            # struttura del prezzo (vedi docstring)
+            take_profit_price = entry_price * (1 + self.fixed_tp_pct)
+        elif self._swing_tracker is not None:
             tp_search_floor = entry_price
             if self.swing_tp_min_r is not None:
                 tp_search_floor = entry_price + self.swing_tp_min_r * (entry_price - stop_price)
@@ -452,6 +512,12 @@ class BUDStrategy(Strategy):
         # se nessun livello e' disponibile (o nessuno sopra il floor minimo in R),
         # take_profit_price resta None e il RiskManager ricade sul multiplo
         # tp_r_multiple (vedi FixedRiskPerTradeManager)
+
+        if self.invalidate_on_close_below_entry_level:
+            # non promuoviamo subito a "posizione aperta": aspettiamo
+            # on_fill, cosi' se il RiskManager rifiuta l'ordine (es. size
+            # non valida) non restiamo a monitorare un trade mai aperto
+            self._pending_entry_level[symbol] = entry_price
 
         signal = SignalEvent(
             symbol=symbol,
@@ -485,3 +551,20 @@ class BUDStrategy(Strategy):
         state.trigger_price = None
         state.stop_ema_at_setup = None
         state.is_fallback_trigger = False
+
+    # ------------------------------------------------------------------
+
+    def on_fill(self, fill: FillEvent) -> None:
+        if not self.invalidate_on_close_below_entry_level:
+            return
+        symbol = fill.symbol
+        if fill.direction == OrderDirection.BUY:
+            # apertura: promuove il livello "in sospeso" (impostato al
+            # momento del segnale) a "posizione aperta" da monitorare
+            level = self._pending_entry_level.pop(symbol, None)
+            if level is not None:
+                self._open_position_level[symbol] = level
+        else:
+            # chiusura (TP/SL risolto dal broker, o il nostro stesso EXIT):
+            # smette di essere una posizione da monitorare
+            self._open_position_level.pop(symbol, None)

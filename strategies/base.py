@@ -11,7 +11,7 @@ che il comportamento sia identico in tutte le fasi.
 from abc import ABC, abstractmethod
 from collections import deque
 
-from core.events import MarketEvent, SignalEvent
+from core.events import FillEvent, MarketEvent, SignalEvent
 
 
 class Strategy(ABC):
@@ -25,6 +25,17 @@ class Strategy(ABC):
         altrimenti None.
         """
         raise NotImplementedError
+
+    def on_fill(self, fill: FillEvent) -> None:
+        """
+        Chiamato dal motore quando un ordine di QUESTA strategia (stesso
+        `source`) viene eseguito — sia in apertura sia in chiusura (via
+        TP/SL risolto dal broker o via un EXIT emesso dalla strategia
+        stessa). Di default no-op: solo le strategie che hanno bisogno di
+        sapere se una posizione e' ancora aperta bar dopo bar (es. per
+        un'invalidazione strutturale, non solo TP/SL fissi) lo implementano.
+        """
+        pass
 
     def reset(self) -> None:
         """Reset dello stato interno (utile tra un backtest e l'altro)."""

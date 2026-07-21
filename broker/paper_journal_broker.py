@@ -69,10 +69,25 @@ class PaperJournalBroker(Broker):
         self._last_price[symbol] = price
 
     def execute_order(self, order: OrderEvent) -> FillEvent:
-        entry_price = self._last_price.get(order.symbol, order.limit_price)
-        if entry_price is None:
+        price = self._last_price.get(order.symbol, order.limit_price)
+        if price is None:
             raise RuntimeError(f"Nessun prezzo disponibile per {order.symbol}")
 
+        source = order.source or "default"
+        key = (order.symbol, source)
+
+        existing = self._open_trades.get(key)
+        if existing is not None and existing.direction != order.direction:
+            # direzione opposta a un trade gia' aperto sulla stessa chiave:
+            # e' un ordine di CHIUSURA (es. un EXIT emesso dalla strategia),
+            # non una nuova apertura — altrimenti sovrascriveremmo il trade
+            # aperto con uno nuovo senza mai registrarne l'esito
+            return self._close_trade(
+                key, existing, price, order.timestamp, outcome="EXIT", is_stop=False
+            )
+
+        # apertura (nuova posizione)
+        entry_price = price
         # slippage sull'entrata (ordine market): il fill peggiora nella
         # direzione del trade
         if self.slippage_pct:
@@ -83,8 +98,7 @@ class PaperJournalBroker(Broker):
 
         entry_commission = abs(entry_price) * order.quantity * self.commission_pct
 
-        source = order.source or "default"
-        self._open_trades[(order.symbol, source)] = _OpenTrade(
+        self._open_trades[key] = _OpenTrade(
             symbol=order.symbol,
             source=source,
             direction=order.direction,
@@ -133,59 +147,63 @@ class PaperJournalBroker(Broker):
             # ipotesi conservativa se toccati entrambi nella stessa barra: vince lo SL
             outcome = "SL" if hit_sl else "TP"
             exit_price = trade.stop_loss if hit_sl else trade.take_profit
-
-            # slippage solo sullo stop (ordine stop/market): il TP e' un limit,
-            # fillato al prezzo esatto
-            if self.slippage_pct and hit_sl:
-                if trade.direction == OrderDirection.BUY:
-                    exit_price *= 1 - self.slippage_pct
-                else:
-                    exit_price *= 1 + self.slippage_pct
-
-            exit_commission = abs(exit_price) * trade.quantity * self.commission_pct
-
-            pnl_per_unit = (
-                exit_price - trade.entry_price
-                if trade.direction == OrderDirection.BUY
-                else trade.entry_price - exit_price
-            )
-            pnl = pnl_per_unit * trade.quantity - trade.entry_commission - exit_commission
-            won = pnl > 0
-
-            self._closed_trades.append(
-                {
-                    "symbol": symbol,
-                    "source": trade.source,
-                    "direction": trade.direction.value,
-                    "entry_price": trade.entry_price,
-                    "exit_price": exit_price,
-                    "outcome": outcome,
-                    "pnl": pnl,
-                    "won": won,
-                    "opened_at": trade.opened_at,
-                    "closed_at": market_event.timestamp,
-                }
-            )
-            del self._open_trades[key]
-
-            exit_direction = (
-                OrderDirection.SELL
-                if trade.direction == OrderDirection.BUY
-                else OrderDirection.BUY
-            )
             fills.append(
-                FillEvent(
-                    symbol=symbol,
-                    timestamp=market_event.timestamp,
-                    direction=exit_direction,
-                    quantity=trade.quantity,
-                    fill_price=exit_price,
-                    commission=exit_commission,
-                    source=trade.source,
+                self._close_trade(
+                    key, trade, exit_price, market_event.timestamp, outcome, is_stop=hit_sl
                 )
             )
 
         return fills
+
+    def _close_trade(
+        self, key, trade: _OpenTrade, exit_price: float, timestamp, outcome: str, is_stop: bool
+    ) -> FillEvent:
+        # slippage solo sullo stop/chiusura a mercato (ordine stop/market):
+        # il TP e' un limit, fillato al prezzo esatto
+        if self.slippage_pct and is_stop:
+            if trade.direction == OrderDirection.BUY:
+                exit_price *= 1 - self.slippage_pct
+            else:
+                exit_price *= 1 + self.slippage_pct
+
+        exit_commission = abs(exit_price) * trade.quantity * self.commission_pct
+
+        pnl_per_unit = (
+            exit_price - trade.entry_price
+            if trade.direction == OrderDirection.BUY
+            else trade.entry_price - exit_price
+        )
+        pnl = pnl_per_unit * trade.quantity - trade.entry_commission - exit_commission
+        won = pnl > 0
+
+        self._closed_trades.append(
+            {
+                "symbol": trade.symbol,
+                "source": trade.source,
+                "direction": trade.direction.value,
+                "entry_price": trade.entry_price,
+                "exit_price": exit_price,
+                "outcome": outcome,
+                "pnl": pnl,
+                "won": won,
+                "opened_at": trade.opened_at,
+                "closed_at": timestamp,
+            }
+        )
+        del self._open_trades[key]
+
+        exit_direction = (
+            OrderDirection.SELL if trade.direction == OrderDirection.BUY else OrderDirection.BUY
+        )
+        return FillEvent(
+            symbol=trade.symbol,
+            timestamp=timestamp,
+            direction=exit_direction,
+            quantity=trade.quantity,
+            fill_price=exit_price,
+            commission=exit_commission,
+            source=trade.source,
+        )
 
     def get_equity(self) -> float:
         # equity virtuale: capitale iniziale + PnL chiusi (non e' un vero conto)
