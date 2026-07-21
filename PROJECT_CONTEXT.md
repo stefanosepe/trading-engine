@@ -468,6 +468,42 @@ for freq, label in [('5min','5m'), ('30min','30m')]:
     r[(r['timestamp'] >= '2019-01-01') & (r['timestamp'] < '2019-05-01')].to_csv(f'data/btcusdt_{label}.csv', index=False)
     r[(r['timestamp'] >= '2017-08-01') & (r['timestamp'] < '2019-11-01')].to_csv(f'data/btcusdt_{label}_full.csv', index=False)
 "
+
+# BTC/USD 2022-2025 (cryptobigbro si ferma a nov 2019, serve altra fonte):
+# repo ff137/bitstamp-btcusd-minute-data, dati Bitstamp 1min 2012-2025, gzippato
+curl -sL "https://raw.githubusercontent.com/ff137/bitstamp-btcusd-minute-data/main/data/historical/btcusd_bitstamp_1min_2012-2025.csv.gz" -o btc_bitstamp_1m.csv.gz
+python3 -c "
+import pandas as pd
+df = pd.read_csv('btc_bitstamp_1m.csv.gz', compression='gzip')
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+df = df.set_index('timestamp')[['open','high','low','close','volume']]
+recent = df[df.index >= '2022-01-01']
+for freq, label in [('1h','1h'), ('4h','4h'), ('1D','1d')]:
+    r = recent.resample(freq).agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
+    r.to_csv(f'data/btcusdt_{label}_recent.csv', index=False)
+"
+
+# Gold/Nasdaq100/Crude Oil (Oanda, dati minuto): git clone diretto NON
+# funziona da questo ambiente (github.com HTTPS 403), ma sparse-checkout con
+# --filter=blob:none si', perche' passa dal protocollo git, non da HTTP semplice
+git clone --filter=blob:none --sparse --depth 1 https://github.com/FutureSharks/financial-data.git fsdata
+cd fsdata
+git sparse-checkout set pyfinancialdata/data/currencies/oanda/NAS100_USD pyfinancialdata/data/currencies/oanda/WTICO_USD pyfinancialdata/data/currencies/oanda/XAU_USD
+cd ..
+python3 -c "
+import pandas as pd, glob
+FS = 'fsdata/pyfinancialdata/data/currencies/oanda'
+for inst, label in [('XAU_USD','gold'), ('NAS100_USD','nasdaq100'), ('WTICO_USD','crudeoil')]:
+    frames = [pd.read_csv(f) for year in (2018, 2019, 2020) for f in sorted(glob.glob(f'{FS}/{inst}/{year}/*.csv'))]
+    df = pd.concat(frames, ignore_index=True)
+    df['timestamp'] = pd.to_datetime(df['time'])
+    df = df.set_index('timestamp')[['open','high','low','close','volume']].sort_index()
+    df = df[~df.index.duplicated(keep='first')]
+    r1h = df.resample('1h').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'}).dropna().reset_index()
+    r1h.to_csv(f'data/{label}_2018_2020_1h.csv', index=False)
+"
+# nota: dati disponibili fino a meta' 2020 in questo repo (non oltre), i file
+# CSV hanno colonne time,close,high,low,open,volume (ordine diverso dal solito)
 ```
 
 ## Filtro "prossimita' massimo/minimo del giorno precedente" (2026-07-21)
@@ -530,6 +566,55 @@ resta simmetrico come tutto il resto della logica BUD.
 (dataset `btc_recent` gia' scaricato in una sessione precedente, non
 riverificato in questo giro) per capire se il segnale regge fuori dal bull
 market 2017-2019 o e' specifico di quel regime.
+
+## Validazione fuori campione: il segnale NON regge (2026-07-21)
+
+Fatto subito il test suggerito sopra. **Esito: il segnale positivo su BTC
+1h 2017-2019 non si generalizza.** Dati usati: BTC/USD Bitstamp 2022-2025
+(`btcusdt_1h_recent.csv`, ricampionato da dati 1m — fonte diversa da
+cryptobigbro perche' quel repo si ferma a novembre 2019, vedi sotto) e
+Gold/Nasdaq100/Crude Oil Oanda 2018-2020 (`{gold,nasdaq100,crudeoil}_2018_2020_1h.csv`,
+ricampionati da dati minuto via sparse-checkout del repo
+FutureSharks/financial-data, stesso schema gia' noto).
+
+| Asset | Periodo | prev_day 0.15-0.2% | Win rate | PnL |
+|---|---|---|---|---|
+| BTC | 2017-2019 (calibrazione) | si' | 45-46% | **+24/+33** |
+| BTC | 2022-2025 (fuori campione) | si' | 29-35% | -91/-216 |
+| BTC | 2022 / 2023 / 2024 (per anno) | si' | 33-36% | tutti negativi (-19/-21) |
+| Gold | 2018-2020 | si' | 24-25% | -579/-938 |
+| Nasdaq100 | 2018-2020 | si' | 19-22% | -441/-543 |
+| Crude Oil | 2018-2020 | si' | 46-54% | **+36/+48** |
+
+Due asset su cinque periodo/asset testati sono positivi (BTC 2017-2019,
+Crude Oil 2018-2020), ma su periodi/asset diversi lo stesso filtro fallisce
+nettamente. **Conclusione onesta: il filtro "prossimita' massimo/minimo di
+ieri" non e' un edge robusto — funziona in alcuni regimi di mercato
+specifici e fallisce in altri, lo stesso pattern gia' visto piu' volte in
+questa sessione di calibrazione.** Non c'e' evidenza sufficiente per
+consigliarne l'uso in produzione senza ulteriori dati/asset.
+
+Nota su Crude Oil: il risultato positivo e' trainato quasi per intero dal
+lato SHORT (68.8% win/+121 vs LONG 35.3%/-82) — probabile riflesso del
+crollo del petrolio di inizio 2020 (prezzi negativi ad aprile 2020) dentro
+questo specifico campione, non necessariamente un'asimmetria strutturale
+long/short della strategia (stesso avvertimento gia' dato per BTC 30m: con
+campioni piccoli, verificare sempre su piu' asset/periodi prima di fidarsi
+di un'asimmetria).
+
+**Bilancio complessivo della sessione di calibrazione**: nessuna
+combinazione di filtri/parametri testata finora (third_touch, swing TP,
+prev_day_extreme, da soli o combinati) produce un edge robusto e
+consistente su asset/periodi diversi con costi realistici. I singoli
+risultati positivi trovati sono sempre isolati a un asset/periodo
+specifico e non sopravvivono al test fuori campione. Questo sposta il
+sospetto dal "filtro d'ingresso sbagliato" a qualcosa di piu' strutturale:
+il TP a multiplo R fisso (o la sua alternativa swing, ugualmente non
+robusta), il timeframe scelto, o il fatto che i pattern osservati negli
+screenshot Discord includono elementi mai modellati (uscite discrezionali,
+piramidazione, gestione dinamica dello stop) che potrebbero essere proprio
+cio' che rende profittevole il trading reale dell'utente rispetto a una
+regola meccanica fissa.
 
 ## Runner disponibili in journal/
 
