@@ -23,6 +23,19 @@ class BUDBidirectionalStrategy(Strategy):
         self._long.reset()
         self._short.reset()
 
+    @property
+    def confluence_log(self) -> list[dict]:
+        """Log combinato long+short (vedi BUDStrategy.log_confluence),
+        con l'aggiunta del campo "direction" per distinguere i due lati.
+        Timestamp/entry_price sono gia' nello spazio reale per il long;
+        per lo short entry_price resta nello spazio mirrorato interno
+        dell'istanza (il conteggio/i fattori di confluenza non dipendono
+        dal segno del prezzo, solo entry_price andrebbe ribaltato se
+        serve confrontarlo con livelli reali)."""
+        long_entries = [{**e, "direction": "LONG"} for e in self._long.confluence_log]
+        short_entries = [{**e, "direction": "SHORT"} for e in self._short.confluence_log]
+        return sorted(long_entries + short_entries, key=lambda e: e["timestamp"])
+
     def on_market_event(self, event: MarketEvent) -> SignalEvent | None:
         long_signal = self._long.on_market_event(event)
 

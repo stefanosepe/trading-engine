@@ -616,6 +616,69 @@ piramidazione, gestione dinamica dello stop) che potrebbero essere proprio
 cio' che rende profittevole il trading reale dell'utente rispetto a una
 regola meccanica fissa.
 
+## TP fisso %, invalidazione strutturale, e ipotesi di confluenza (2026-07-21)
+
+Da un'analisi manuale con l'utente di un trade reale (BTC/USDT 1h, entrata
+long il 18/07/2026), tre idee nuove, tutte implementate e testate:
+
+**1. TP fisso in percentuale** (`fixed_tp_pct`) e **2. invalidazione
+strutturale** (`invalidate_on_close_below_entry_level`, esce se una barra
+CHIUDE sotto il livello di rottura invece di aspettare lo stop pieno).
+Per implementare la seconda serviva sapere quando una posizione e' davvero
+aperta/chiusa bar dopo bar (non solo al momento del segnale): aggiunto
+`Strategy.on_fill` (default no-op, vedi `strategies/base.py`) chiamato da
+`Engine._notify_fill` ad ogni fill, sia apertura sia chiusura.
+`BUDBidirectionalStrategy.on_fill` inoltra a entrambe le istanze interne,
+ribaltando direzione e prezzo per quella short. **Bug collegato scoperto e
+fixato**: `PaperJournalBroker.execute_order` trattava OGNI ordine come
+un'apertura — un EXIT per chiudere una posizione ne apriva invece una
+nuova nella direzione opposta senza registrare l'esito del trade originale.
+Ora riconosce un ordine di direzione opposta a un trade gia' aperto sulla
+stessa chiave come chiusura (`_close_trade`, condivisa con `check_pending`).
+
+Testate applicate come default UNIVERSALE a tutti i segnali BUD (non solo
+al tipo di setup manualmente analizzato) su BTC 1h/5m/30m, storico e
+recente: **entrambe peggiorano sistematicamente i risultati** — atteso,
+dato che nascono dall'osservazione di un singolo trade specifico via
+hindsight, non da un pattern generale. Il TP fisso all'1% specialmente e'
+molto peggio del 2R fisso (win rate 10-17% invece di 30-40%): su molti
+trade il target da 1% e' troppo lontano rispetto allo stop reale (spesso
+piu' stretto dell'1%), quindi il win rate implicito di breakeven sale
+parecchio sopra 1% di reward. Nessuna regressione sul comportamento di
+default (entrambi i parametri opt-in).
+
+**3. Ipotesi di confluenza**: l'utente ha proposto che piu' trigger
+strutturali indipendenti (BUD, terzo tocco, prossimita' al massimo/minimo
+di ieri, prossimita' al massimo/minimo di oggi) allineati sullo stesso
+livello dovrebbero rendere il trade piu' affidabile — non un gate
+rigido ma un punteggio di confluenza. Prima di codificarlo come filtro,
+misurato empiricamente: nuovo `log_confluence=True` in `BUDStrategy`
+registra (senza influenzare l'ingresso) quanti di questi fattori sono
+veri per ogni trigger, esposto via `confluence_log` (property combinata
+su `BUDBidirectionalStrategy`). Nota implementativa: il "massimo di oggi"
+usato per il confronto e' quello ANTECEDENTE alla barra di rottura stessa
+(snapshot preso prima di aggiornare il massimo del giorno con la barra
+corrente) — altrimenti il check sarebbe quasi tautologico ogni volta che
+la barra di rottura e' anche il nuovo massimo di giornata.
+
+**Risultato: l'ipotesi NON e' supportata dai dati.** Su BTC/USDT 1h
+(2017-2019 e 2024-oggi), i trade SENZA alcuna conferma extra (confluenza
+0) vanno meglio o alla pari di quelli con piu' conferme; sul campione
+recente (227 trade, il piu' affidabile) avere tutti e 3 i fattori allineati
+e' la categoria PEGGIORE (28.9% win rate, pnl -264) contro il 44.7%/+33
+della categoria senza conferme. Ogni singolo fattore preso isolatamente
+(terzo tocco, prossimita' ieri, prossimita' oggi) correla con risultati
+peggiori del baseline "nessuna conferma" su entrambi i periodi, tranne
+`today_extreme` che e' il migliore sul periodo vecchio (+109) ma il
+peggiore su quello recente (-614) — la stessa inconsistenza tra periodi
+gia' vista piu' volte in questa sessione con altri filtri. Possibili
+letture, nessuna verificata: (a) la "vicinanza" e' misurata nel modo
+sbagliato (tolleranza/timing), (b) l'edge su BTC 1h e' troppo debole
+ovunque perche' il segnale emerga dal rumore, (c) l'ipotesi vale per
+setup piu' selettivi di quanto il rilevamento BUD a candele riesca a
+catturare meccanicamente. Da riverificare su altri asset/timeframe prima
+di scartarla definitivamente.
+
 ## Runner disponibili in journal/
 
 - `run_journal_backtest.py` / `run_journal_live.py` — journal generico con

@@ -103,6 +103,7 @@ class BUDStrategy(Strategy):
         prev_day_extreme_proximity_pct: float = 0.01,
         fixed_tp_pct: float | None = None,
         invalidate_on_close_below_entry_level: bool = False,
+        log_confluence: bool = False,
     ):
         """
         ema_trend_period: se valorizzata, aggiunge il filtro di trend — si
@@ -178,6 +179,19 @@ class BUDStrategy(Strategy):
         sotto e chiude li', meglio uscire in perdita piccola che aspettare
         lo stop pieno".
 
+        log_confluence: se True, ad ogni entrata la strategia calcola e
+        registra (in `confluence_log`, senza influenzare in alcun modo se
+        il segnale scatta o no) QUANTI di questi fattori strutturali sono
+        veri per quel trigger: terzo tocco nelle vicinanze, prossimita' al
+        massimo del giorno precedente, prossimita' al massimo del giorno
+        IN CORSO fino a quel momento. Attiva anche il tracciamento di terzo
+        tocco/giorno precedente/giorno in corso anche se i rispettivi
+        require_* sono False, cosi' si puo' misurare se la confluenza
+        correla col win rate PRIMA di trasformarla in un filtro rigido —
+        nato da un'ipotesi esplicita dell'utente ("piu' trigger nelle
+        vicinanze, piu' il trade dovrebbe essere affidabile") da verificare
+        sui dati invece di assumerla.
+
         Nota sul lato short (via BUDBidirectionalStrategy): sia il detector
         del terzo tocco sia SwingLevelTracker e il tracker del giorno
         precedente usano sempre lo spazio dati "long"/resistenza — per
@@ -207,6 +221,8 @@ class BUDStrategy(Strategy):
         self.prev_day_extreme_proximity_pct = prev_day_extreme_proximity_pct
         self.fixed_tp_pct = fixed_tp_pct
         self.invalidate_on_close_below_entry_level = invalidate_on_close_below_entry_level
+        self.log_confluence = log_confluence
+        self.confluence_log: list[dict] = []
 
         self._ema_fast_alpha = 2 / (ema_fast_period + 1)
         self._ema_stop_alpha = 2 / (ema_stop_period + 1)
@@ -227,7 +243,7 @@ class BUDStrategy(Strategy):
                 tolerance_pct=third_touch_tolerance_pct,
                 approach_pct=third_touch_approach_pct,
             )
-            if require_third_touch
+            if (require_third_touch or log_confluence)
             else None
         )
         self._swing_tracker = (
@@ -245,6 +261,7 @@ class BUDStrategy(Strategy):
         self._current_day: dict[str, object] = {}
         self._current_day_high: dict[str, float] = {}
         self._prev_day_high: dict[str, float | None] = {}
+        self._today_high_before_bar: dict[str, float | None] = {}
 
         # invalidazione strutturale: livello che deve tenere, impostato su
         # on_fill quando l'entrata viene davvero eseguita (non al momento
@@ -267,6 +284,8 @@ class BUDStrategy(Strategy):
         self._pending_entry_level.clear()
         self._open_position_level.clear()
         self._prev_day_high.clear()
+        self._today_high_before_bar.clear()
+        self.confluence_log.clear()
         if self._third_touch is not None:
             self._third_touch.reset()
         if self._swing_tracker is not None:
@@ -305,7 +324,12 @@ class BUDStrategy(Strategy):
             info = self._third_touch.on_market_event(event)
             if info is not None and (info.approaching_third or info.third_touch_confirmed):
                 self._last_confluence[symbol] = (info.level_price, self._bars_seen[symbol])
-        if self.require_prev_day_extreme:
+        if self.require_prev_day_extreme or self.log_confluence:
+            # snapshot PRIMA di aggiornare: rappresenta il massimo di oggi
+            # fatto da barre precedenti, non da questa stessa candela (che
+            # altrimenti farebbe match banalmente ogni volta che la
+            # candela di rottura e' anche il nuovo massimo di giornata)
+            self._today_high_before_bar[symbol] = self._current_day_high.get(symbol)
             self._update_prev_day_high(symbol, candle)
 
         min_bars = max(self.ema_stop_period, self.atr_period, self.ema_trend_period or 0) + 1
@@ -519,6 +543,9 @@ class BUDStrategy(Strategy):
             # non valida) non restiamo a monitorare un trade mai aperto
             self._pending_entry_level[symbol] = entry_price
 
+        if self.log_confluence:
+            self._log_confluence(symbol, entry_price, candle)
+
         signal = SignalEvent(
             symbol=symbol,
             timestamp=candle.timestamp,
@@ -529,6 +556,36 @@ class BUDStrategy(Strategy):
 
         self._reset_to_scanning(state, candle)
         return signal
+
+    def _log_confluence(self, symbol: str, entry_price: float, candle: _Candle) -> None:
+        """Misura (senza filtrare) quanti trigger strutturali indipendenti
+        sono presenti vicino al prezzo di entrata: terzo tocco, massimo di
+        ieri, massimo di oggi fin qui. Non e' detto che questi coincidano
+        col livello BUD stesso — e' proprio il punto: la CONFLUENZA tra
+        pattern diversi, non solo il BUD in se'."""
+        proximity = self.prev_day_extreme_proximity_pct
+        factors = []
+
+        if self._has_third_touch_confluence(symbol, entry_price):
+            factors.append("third_touch")
+
+        prev_high = self._prev_day_high.get(symbol)
+        if prev_high is not None and abs(entry_price - prev_high) / abs(prev_high) <= proximity:
+            factors.append("prev_day_extreme")
+
+        today_high = self._today_high_before_bar.get(symbol)
+        if today_high is not None and abs(entry_price - today_high) / abs(today_high) <= proximity:
+            factors.append("today_extreme")
+
+        self.confluence_log.append(
+            {
+                "symbol": symbol,
+                "timestamp": candle.timestamp,
+                "entry_price": entry_price,
+                "confluence_count": len(factors),
+                "factors": factors,
+            }
+        )
 
     def _has_third_touch_confluence(self, symbol: str, entry_price: float) -> bool:
         confluence = self._last_confluence.get(symbol)
