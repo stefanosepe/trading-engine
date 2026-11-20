@@ -57,10 +57,10 @@ class StatusHandler(BaseHTTPRequestHandler):
         pass
 
 
-def start_status_server(port: int):
-    server = HTTPServer(("localhost", port), StatusHandler)
+def start_status_server(port: int, host: str = "localhost"):
+    server = HTTPServer((host, port), StatusHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    logger.info("Stato consultabile su http://localhost:%d/status", port)
+    logger.info("Stato consultabile su http://%s:%d/status", host, port)
 
 
 def main():
@@ -73,6 +73,10 @@ def main():
     parser.add_argument("--sl-pct", type=float, default=0.02, help="stop-loss, es 0.02 = 2%%")
     parser.add_argument("--tp-pct", type=float, default=0.04, help="take-profit, es 0.04 = 4%%")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument(
+        "--host", default="localhost",
+        help="interfaccia del server di stato (0.0.0.0 dentro un container)",
+    )
     args = parser.parse_args()
 
     import ccxt
@@ -87,7 +91,7 @@ def main():
     )
     _BROKER = PaperJournalBroker()
 
-    start_status_server(args.port)
+    start_status_server(args.port, args.host)
 
     engine = Engine(
         data_feed=feed,
