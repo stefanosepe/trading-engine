@@ -1,0 +1,33 @@
+# Journal live: paper trading su carta con dati pubblici di mercato.
+# Nessuna API key, nessun ordine reale.
+services:
+  journal-live:
+    build: .
+    image: trading-engine:latest
+    container_name: journal-live
+    command:
+      - python
+      - -m
+      - journal.run_journal_live
+      - --host=0.0.0.0
+      - --symbol=${SYMBOL:-BTC/USDT}
+      - --timeframe=${TIMEFRAME:-1h}
+      - --exchange=${EXCHANGE:-binance}
+      - --sl-pct=${SL_PCT:-0.02}
+      - --tp-pct=${TP_PCT:-0.04}
+    # esposto solo su localhost dell'host: si consulta via tunnel SSH,
+    # non e' raggiungibile da internet anche se il security group fosse aperto
+    ports:
+      - "127.0.0.1:8766:8766"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8766/status', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
