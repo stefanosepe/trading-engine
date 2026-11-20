@@ -1,6 +1,6 @@
 # Trading System — scheletro infrastrutturale
 
-[![tests](https://github.com/stefanosepe/tradingBot/actions/workflows/tests.yml/badge.svg)](https://github.com/stefanosepe/tradingBot/actions/workflows/tests.yml)
+[![tests](https://github.com/stefanosepe/trading-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/stefanosepe/trading-engine/actions/workflows/tests.yml)
 
 Architettura event-driven: `DataFeed → Strategy → RiskManager → Broker → Portfolio`.
 Lo stesso `Engine` (core/engine.py) gira identico in backtest, paper trading e live:
