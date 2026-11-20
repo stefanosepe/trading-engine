@@ -41,6 +41,10 @@ risultati dei test sono in [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md).
 > I risultati riportati sono al lordo dei costi di transazione e con parametri non
 > ancora calibrati: servono a validare l'infrastruttura, non a promettere rendimenti.
 
+## Deploy
+
+Il journal live gira in Docker su AWS EC2 con `docker compose up -d`: healthcheck, riavvio automatico, rotazione dei log e stato consultabile via tunnel SSH. Guida completa in [`docs/deploy-ec2.md`](docs/deploy-ec2.md).
+
 ## Struttura
 
 ```
